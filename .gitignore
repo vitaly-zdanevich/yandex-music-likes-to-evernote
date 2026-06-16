@@ -1,0 +1,4 @@
+/target/
+/.env
+/state.json
+/notes.enex
