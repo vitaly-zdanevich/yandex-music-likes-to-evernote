@@ -1,5 +1,17 @@
 # Yandex Music Likes to Evernote
 
+[![Quality Gate Status](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=alert_status)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Reliability Rating](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=reliability_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Security Rating](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=security_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Maintainability Rating](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=sqale_rating)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Coverage](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=coverage)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Duplicated Lines (%)](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=duplicated_lines_density)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Bugs](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=bugs)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Vulnerabilities](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=vulnerabilities)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Code Smells](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=code_smells)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+[![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
+
 Rust CLI for a scheduled GitHub Actions job that exports newly liked Yandex Music tracks to Evernote as metadata notes.
 
 It does **not** download or copy Yandex Music catalog audio. Each Evernote note contains track metadata and links back to Yandex Music.
