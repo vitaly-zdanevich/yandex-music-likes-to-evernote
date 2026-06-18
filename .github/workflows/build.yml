@@ -1,0 +1,104 @@
+name: Build
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true
+
+jobs:
+  rust:
+    name: Rust
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install Rust toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component rustfmt --component clippy
+          rustup default stable
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-${{ runner.os }}-
+
+      - name: Check formatting
+        run: cargo fmt --all -- --check
+
+      - name: Test
+        run: cargo test --locked --all-targets
+
+      - name: Clippy
+        run: cargo clippy --locked --all-targets -- -D warnings
+
+  sonarqube:
+    name: SonarQube
+    runs-on: ubuntu-latest
+    env:
+      SONAR_TOKEN: ${{ secrets.SONAR_TOKEN }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0 # Shallow clones should be disabled for a better relevancy of analysis
+
+      - name: Install Rust coverage toolchain
+        run: |
+          rustup toolchain install stable --profile minimal --component llvm-tools-preview
+          rustup default stable
+
+      - name: Restore Cargo cache
+        uses: actions/cache@v5
+        with:
+          path: |
+            target
+            ~/.cargo/registry
+            ~/.cargo/git
+          key: cargo-coverage-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-coverage-${{ runner.os }}-
+
+      - name: Restore cargo-llvm-cov binary cache
+        id: cargo-llvm-cov-cache
+        uses: actions/cache@v5
+        with:
+          path: ~/.cargo/bin/cargo-llvm-cov
+          key: cargo-llvm-cov-${{ runner.os }}-stable-v1
+
+      - name: Install cargo-llvm-cov
+        if: steps.cargo-llvm-cov-cache.outputs.cache-hit != 'true'
+        run: cargo install cargo-llvm-cov --locked
+
+      - name: Show cargo-llvm-cov version
+        run: cargo llvm-cov --version
+
+      - name: Generate Rust coverage
+        run: cargo llvm-cov --locked --all-targets --lcov --output-path target/lcov.info
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v7
+        with:
+          name: lcov
+          path: target/lcov.info
+          retention-days: 14
+
+      - name: SonarQube Scan
+        if: ${{ env.SONAR_TOKEN != '' }}
+        uses: SonarSource/sonarqube-scan-action@7006c4492b2e0ee0f816d36501671557c97f5995 # v8.1.0
+        env:
+          SONAR_TOKEN: ${{ env.SONAR_TOKEN }}

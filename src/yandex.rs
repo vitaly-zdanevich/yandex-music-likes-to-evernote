@@ -83,7 +83,7 @@ impl YandexClient {
             }));
         }
 
-        tracks.sort_by(|left, right| left.liked_at.cmp(&right.liked_at));
+        tracks.sort_by_key(|track| track.liked_at);
         Ok(tracks)
     }
 }

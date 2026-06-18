@@ -17,7 +17,7 @@ pub struct Settings {
     #[arg(
         long,
         env = "EVERNOTE_USER_STORE_URL",
-        default_value = "https://www.evernote.com/edam/user"
+        default_value = DEFAULT_EVERNOTE_USER_STORE_URL
     )]
     pub evernote_user_store_url: String,
     #[arg(long, env = "EVERNOTE_NOTEBOOK_GUID")]
