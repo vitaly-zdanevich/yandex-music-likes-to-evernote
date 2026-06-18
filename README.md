@@ -29,6 +29,10 @@ Optional GitHub Actions repository variables:
 
 External enrichment sends artist/title/album/link metadata to the selected public services. It never copies lyrics into Evernote.
 
+## First Run
+
+The first run is limited by `MAX_TRACKS_PER_RUN`, not by age. With the default configuration, it creates notes for up to `10` previously unprocessed liked tracks. Increase `MAX_TRACKS_PER_RUN` if you want a larger initial backfill.
+
 ## GitHub Actions Schedule
 
 The workflow in `.github/workflows/sync.yml` runs daily at `03:17` UTC and can also be started manually from the GitHub Actions tab.
