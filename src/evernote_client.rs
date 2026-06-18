@@ -65,7 +65,8 @@ where
     note_store_url: Option<String>,
     user_store_url: String,
     resolved_note_store_url: Arc<Mutex<Option<String>>>,
-    notebook_guid: Option<String>,
+    notebook_selector: Option<String>,
+    resolved_notebook_guid: Arc<Mutex<Option<String>>>,
     http: C,
 }
 
@@ -74,13 +75,13 @@ impl EvernoteClient<ReqwestThriftHttpClient> {
         token: impl Into<String>,
         note_store_url: Option<String>,
         user_store_url: impl Into<String>,
-        notebook_guid: Option<String>,
+        notebook_selector: Option<String>,
     ) -> Result<Self> {
         Ok(Self::with_http_client(
             token,
             note_store_url,
             user_store_url,
-            notebook_guid,
+            notebook_selector,
             ReqwestThriftHttpClient::new()?,
         ))
     }
@@ -94,7 +95,7 @@ where
         token: impl Into<String>,
         note_store_url: Option<String>,
         user_store_url: impl Into<String>,
-        notebook_guid: Option<String>,
+        notebook_selector: Option<String>,
         http: C,
     ) -> Self {
         Self {
@@ -102,17 +103,19 @@ where
             note_store_url,
             user_store_url: user_store_url.into(),
             resolved_note_store_url: Arc::new(Mutex::new(None)),
-            notebook_guid,
+            notebook_selector,
+            resolved_notebook_guid: Arc::new(Mutex::new(None)),
             http,
         }
     }
 
     pub fn create_track_note(&self, title: String, content: String) -> Result<String> {
+        let notebook_guid = self.notebook_guid()?;
         let mut client = self.note_store_client()?;
         let note = types::Note {
             title: Some(title),
             content: Some(content),
-            notebook_guid: self.notebook_guid.clone(),
+            notebook_guid,
             attributes: Some(NoteAttributes {
                 source: Some("yandex-music-likes-to-evernote".to_string()),
                 source_application: Some(CLIENT_NAME.to_string()),
@@ -189,6 +192,67 @@ where
         urls.note_store_url
             .context("Evernote UserStore did not return a NoteStore URL")
     }
+
+    fn notebook_guid(&self) -> Result<Option<String>> {
+        let Some(selector) = &self.notebook_selector else {
+            return Ok(None);
+        };
+
+        if is_evernote_guid(selector) {
+            return Ok(Some(selector.clone()));
+        }
+
+        if let Some(guid) = self
+            .resolved_notebook_guid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Evernote notebook GUID cache is poisoned"))?
+            .clone()
+        {
+            return Ok(Some(guid));
+        }
+
+        let guid = self.fetch_notebook_guid_by_name(selector)?;
+        *self
+            .resolved_notebook_guid
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Evernote notebook GUID cache is poisoned"))? =
+            Some(guid.clone());
+        Ok(Some(guid))
+    }
+
+    fn fetch_notebook_guid_by_name(&self, name: &str) -> Result<String> {
+        let mut client = self.note_store_client()?;
+        let notebooks = client
+            .list_notebooks(self.token.clone())
+            .map_err(|error| anyhow::anyhow!("Evernote API error: {error}"))?;
+        let mut matches = notebooks
+            .into_iter()
+            .filter(|notebook| notebook.name.as_deref() == Some(name));
+        let notebook = matches
+            .next()
+            .with_context(|| format!("Evernote notebook named '{name}' was not found"))?;
+        if matches.next().is_some() {
+            return Err(anyhow::anyhow!(
+                "Evernote returned more than one notebook named '{name}'"
+            ));
+        }
+
+        notebook
+            .guid
+            .with_context(|| format!("Evernote notebook named '{name}' did not include a GUID"))
+    }
+}
+
+fn is_evernote_guid(value: &str) -> bool {
+    let bytes = value.as_bytes();
+    if bytes.len() != 36 {
+        return false;
+    }
+
+    bytes.iter().enumerate().all(|(index, byte)| match index {
+        8 | 13 | 18 | 23 => *byte == b'-',
+        _ => byte.is_ascii_hexdigit(),
+    })
 }
 
 #[derive(Clone)]
@@ -308,6 +372,7 @@ mod tests {
 
     const NOTE_STORE_URL: &str = "https://www.evernote.com/shard/s1/notestore";
     const USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
+    const NOTEBOOK_GUID: &str = "00000000-0000-0000-0000-000000000001";
 
     #[derive(Clone, Default)]
     struct MockHttpClient {
@@ -452,6 +517,19 @@ mod tests {
         })
     }
 
+    fn list_notebooks_response(notebooks: Vec<types::Notebook>) -> Vec<u8> {
+        let result = note_store::NoteStoreListNotebooksResult {
+            result_value: Some(notebooks),
+            user_exception: None,
+            system_exception: None,
+        };
+        thrift_response("listNotebooks", |protocol| {
+            result
+                .write_to_out_protocol(protocol)
+                .expect("write list notebooks result")
+        })
+    }
+
     #[test]
     fn create_track_note_sends_create_note_request() {
         let http = MockHttpClient::default();
@@ -460,7 +538,7 @@ mod tests {
             "token",
             Some(NOTE_STORE_URL.to_string()),
             USER_STORE_URL,
-            Some("notebook-guid".to_string()),
+            Some(NOTEBOOK_GUID.to_string()),
             http.clone(),
         );
 
@@ -482,7 +560,7 @@ mod tests {
         assert_eq!(requests[0].note.title.as_deref(), Some("Title"));
         assert_eq!(
             requests[0].note.notebook_guid.as_deref(),
-            Some("notebook-guid")
+            Some(NOTEBOOK_GUID)
         );
         assert_eq!(
             requests[0].note.tag_names.as_ref().unwrap(),
@@ -500,7 +578,7 @@ mod tests {
             "token",
             None,
             USER_STORE_URL,
-            Some("notebook-guid".to_string()),
+            Some(NOTEBOOK_GUID.to_string()),
             http.clone(),
         );
 
@@ -530,5 +608,75 @@ mod tests {
                 }
             ]
         );
+    }
+
+    #[test]
+    fn create_track_note_resolves_notebook_name_once() {
+        let http = MockHttpClient::default();
+        http.push_response(list_notebooks_response(vec![
+            types::Notebook {
+                guid: Some("00000000-0000-0000-0000-000000000999".to_string()),
+                name: Some("Other".to_string()),
+                ..types::Notebook::default()
+            },
+            types::Notebook {
+                guid: Some(NOTEBOOK_GUID.to_string()),
+                name: Some("Music Inbox".to_string()),
+                ..types::Notebook::default()
+            },
+        ]));
+        http.push_response(create_note_response("first-note-guid"));
+        http.push_response(create_note_response("second-note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some("Music Inbox".to_string()),
+            http.clone(),
+        );
+
+        let first_guid = client
+            .create_track_note("First".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect("create first note");
+        let second_guid = client
+            .create_track_note("Second".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect("create second note");
+
+        assert_eq!(first_guid, "first-note-guid");
+        assert_eq!(second_guid, "second-note-guid");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "listNotebooks".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                }
+            ]
+        );
+        let requests = http.create_requests();
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests[0].note.notebook_guid.as_deref(),
+            Some(NOTEBOOK_GUID)
+        );
+        assert_eq!(
+            requests[1].note.notebook_guid.as_deref(),
+            Some(NOTEBOOK_GUID)
+        );
+    }
+
+    #[test]
+    fn detects_evernote_guid_shape() {
+        assert!(is_evernote_guid(NOTEBOOK_GUID));
+        assert!(!is_evernote_guid("Music Inbox"));
+        assert!(!is_evernote_guid("notebook-guid"));
     }
 }

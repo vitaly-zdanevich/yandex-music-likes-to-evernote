@@ -19,7 +19,7 @@ Optional GitHub Actions repository secrets or variables:
 Optional GitHub Actions repository variables:
 
 - `EVERNOTE_USER_STORE_URL`: Evernote UserStore URL used for NoteStore discovery. Defaults to `https://www.evernote.com/edam/user`.
-- `EVERNOTE_NOTEBOOK_GUID`: target notebook GUID. If omitted, Evernote uses the default notebook.
+- `EVERNOTE_NOTEBOOK_GUID`: target notebook GUID or exact notebook name. If omitted, Evernote uses the default notebook.
 - `STATE_PATH`: state JSON file path. Defaults to `state.json`.
 - `DRY_RUN`: set to `true` to print notes without creating them.
 - `MAX_TRACKS_PER_RUN`: cap created notes per run. Defaults to `10`.
