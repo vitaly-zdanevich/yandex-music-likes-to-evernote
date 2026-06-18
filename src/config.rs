@@ -4,6 +4,7 @@ use anyhow::{Result, anyhow};
 use clap::Parser;
 
 pub const DEFAULT_EVERNOTE_USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
+pub const DEFAULT_EVERNOTE_TAG: &str = "yandex-music";
 
 #[derive(Debug, Clone, Parser)]
 pub struct Settings {
@@ -21,6 +22,8 @@ pub struct Settings {
     pub evernote_user_store_url: String,
     #[arg(long, env = "EVERNOTE_NOTEBOOK_GUID")]
     pub evernote_notebook_guid: Option<String>,
+    #[arg(long, env = "EVERNOTE_TAGS", default_value = DEFAULT_EVERNOTE_TAG)]
+    pub evernote_tags: String,
     #[arg(long, env = "STATE_PATH", default_value = "state.json")]
     pub state_path: PathBuf,
     #[arg(long, env = "DRY_RUN", default_value_t = false)]
@@ -54,6 +57,7 @@ impl Settings {
             .evernote_notebook_guid
             .map(|guid| guid.trim().to_string())
             .filter(|guid| !guid.is_empty());
+        self.evernote_tags = parse_comma_separated("EVERNOTE_TAGS", &self.evernote_tags)?.join(",");
         self.genius_access_token = self
             .genius_access_token
             .map(|token| token.trim().to_string())
@@ -71,6 +75,10 @@ impl Settings {
 
         Ok(self)
     }
+
+    pub fn evernote_tag_names(&self) -> Result<Vec<String>> {
+        parse_comma_separated("EVERNOTE_TAGS", &self.evernote_tags)
+    }
 }
 
 fn require_non_empty(name: &str, value: &str) -> Result<()> {
@@ -78,6 +86,19 @@ fn require_non_empty(name: &str, value: &str) -> Result<()> {
         return Err(anyhow!("{name} must not be empty"));
     }
     Ok(())
+}
+
+fn parse_comma_separated(name: &str, value: &str) -> Result<Vec<String>> {
+    let items = value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(ToString::to_string)
+        .collect::<Vec<_>>();
+    if items.is_empty() {
+        return Err(anyhow!("{name} must contain at least one non-empty value"));
+    }
+    Ok(items)
 }
 
 #[cfg(test)]
@@ -91,6 +112,7 @@ mod tests {
             evernote_note_store_url: None,
             evernote_user_store_url: DEFAULT_EVERNOTE_USER_STORE_URL.to_string(),
             evernote_notebook_guid: None,
+            evernote_tags: DEFAULT_EVERNOTE_TAG.to_string(),
             state_path: "state.json".into(),
             dry_run: false,
             max_tracks_per_run: 10,
@@ -109,6 +131,10 @@ mod tests {
             settings.evernote_user_store_url,
             DEFAULT_EVERNOTE_USER_STORE_URL
         );
+        assert_eq!(
+            settings.evernote_tag_names().expect("tags"),
+            vec![DEFAULT_EVERNOTE_TAG]
+        );
     }
 
     #[test]
@@ -119,5 +145,32 @@ mod tests {
         let settings = settings.validate().expect("valid settings");
 
         assert_eq!(settings.evernote_note_store_url, None);
+    }
+
+    #[test]
+    fn parses_comma_separated_evernote_tags() {
+        let mut settings = base_settings();
+        settings.evernote_tags = "music, liked tracks, evernote ".to_string();
+
+        let settings = settings.validate().expect("valid settings");
+
+        assert_eq!(
+            settings.evernote_tag_names().expect("tags"),
+            vec!["music", "liked tracks", "evernote"]
+        );
+        assert_eq!(settings.evernote_tags, "music,liked tracks,evernote");
+    }
+
+    #[test]
+    fn rejects_empty_evernote_tags() {
+        let mut settings = base_settings();
+        settings.evernote_tags = " , ".to_string();
+
+        let error = settings.validate().expect_err("invalid tags");
+
+        assert_eq!(
+            error.to_string(),
+            "EVERNOTE_TAGS must contain at least one non-empty value"
+        );
     }
 }

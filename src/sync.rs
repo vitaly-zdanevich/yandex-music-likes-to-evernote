@@ -17,6 +17,7 @@ pub async fn run(settings: Settings) -> Result<()> {
         settings.evernote_note_store_url.clone(),
         settings.evernote_user_store_url.clone(),
         settings.evernote_notebook_guid.clone(),
+        settings.evernote_tag_names()?,
     )?;
     let enrichment = if settings.enrich_external_links {
         Some(EnrichmentClient::new(

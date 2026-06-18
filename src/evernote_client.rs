@@ -67,6 +67,7 @@ where
     resolved_note_store_url: Arc<Mutex<Option<String>>>,
     notebook_selector: Option<String>,
     resolved_notebook_guid: Arc<Mutex<Option<String>>>,
+    tag_names: Vec<String>,
     http: C,
 }
 
@@ -76,12 +77,14 @@ impl EvernoteClient<ReqwestThriftHttpClient> {
         note_store_url: Option<String>,
         user_store_url: impl Into<String>,
         notebook_selector: Option<String>,
+        tag_names: Vec<String>,
     ) -> Result<Self> {
         Ok(Self::with_http_client(
             token,
             note_store_url,
             user_store_url,
             notebook_selector,
+            tag_names,
             ReqwestThriftHttpClient::new()?,
         ))
     }
@@ -96,6 +99,7 @@ where
         note_store_url: Option<String>,
         user_store_url: impl Into<String>,
         notebook_selector: Option<String>,
+        tag_names: Vec<String>,
         http: C,
     ) -> Self {
         Self {
@@ -105,6 +109,7 @@ where
             resolved_note_store_url: Arc::new(Mutex::new(None)),
             notebook_selector,
             resolved_notebook_guid: Arc::new(Mutex::new(None)),
+            tag_names,
             http,
         }
     }
@@ -121,7 +126,7 @@ where
                 source_application: Some(CLIENT_NAME.to_string()),
                 ..NoteAttributes::default()
             }),
-            tag_names: Some(vec!["yandex-music".to_string()]),
+            tag_names: Some(self.tag_names.clone()),
             ..types::Note::default()
         };
 
@@ -374,6 +379,10 @@ mod tests {
     const USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
     const NOTEBOOK_GUID: &str = "00000000-0000-0000-0000-000000000001";
 
+    fn tag_names() -> Vec<String> {
+        vec!["music".to_string(), "liked tracks".to_string()]
+    }
+
     #[derive(Clone, Default)]
     struct MockHttpClient {
         inner: Arc<Mutex<MockHttpClientInner>>,
@@ -539,6 +548,7 @@ mod tests {
             Some(NOTE_STORE_URL.to_string()),
             USER_STORE_URL,
             Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
             http.clone(),
         );
 
@@ -564,7 +574,7 @@ mod tests {
         );
         assert_eq!(
             requests[0].note.tag_names.as_ref().unwrap(),
-            &vec!["yandex-music".to_string()]
+            &vec!["music".to_string(), "liked tracks".to_string()]
         );
     }
 
@@ -579,6 +589,7 @@ mod tests {
             None,
             USER_STORE_URL,
             Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
             http.clone(),
         );
 
@@ -632,6 +643,7 @@ mod tests {
             Some(NOTE_STORE_URL.to_string()),
             USER_STORE_URL,
             Some("Music Inbox".to_string()),
+            tag_names(),
             http.clone(),
         );
 

@@ -23,6 +23,7 @@ jobs:
       EVERNOTE_NOTE_STORE_URL: ${{ secrets.EVERNOTE_NOTE_STORE_URL || vars.EVERNOTE_NOTE_STORE_URL }}
       EVERNOTE_USER_STORE_URL: ${{ vars.EVERNOTE_USER_STORE_URL || 'https://www.evernote.com/edam/user' }}
       EVERNOTE_NOTEBOOK_GUID: ${{ vars.EVERNOTE_NOTEBOOK_GUID }}
+      EVERNOTE_TAGS: ${{ secrets.EVERNOTE_TAGS || vars.EVERNOTE_TAGS || 'yandex-music' }}
       GENIUS_ACCESS_TOKEN: ${{ secrets.GENIUS_ACCESS_TOKEN }}
       STATE_PATH: ${{ vars.STATE_PATH || 'state.json' }}
       DRY_RUN: ${{ vars.DRY_RUN || 'false' }}

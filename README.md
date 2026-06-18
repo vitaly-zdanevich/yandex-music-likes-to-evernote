@@ -15,6 +15,7 @@ Set these GitHub Actions repository secrets:
 Optional GitHub Actions repository secrets or variables:
 
 - `EVERNOTE_NOTE_STORE_URL`: account-specific Evernote NoteStore URL. If omitted, the tool asks Evernote UserStore for the right NoteStore URL using `EVERNOTE_AUTH_TOKEN`.
+- `EVERNOTE_TAGS`: comma-separated Evernote tags to apply to created notes. Defaults to `yandex-music`.
 
 Optional GitHub Actions repository variables:
 
