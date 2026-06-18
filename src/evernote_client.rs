@@ -5,6 +5,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use evernote::note_store::{NoteStoreSyncClient, TNoteStoreSyncClient};
 use evernote::types::{self, NoteAttributes};
+use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
 use reqwest::blocking::Client as ReqwestClient;
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{ReadHalf, TIoChannel, WriteHalf};
@@ -61,7 +62,9 @@ where
     C: ThriftHttpClient,
 {
     token: String,
-    note_store_url: String,
+    note_store_url: Option<String>,
+    user_store_url: String,
+    resolved_note_store_url: Arc<Mutex<Option<String>>>,
     notebook_guid: Option<String>,
     http: C,
 }
@@ -69,12 +72,14 @@ where
 impl EvernoteClient<ReqwestThriftHttpClient> {
     pub fn new(
         token: impl Into<String>,
-        note_store_url: impl Into<String>,
+        note_store_url: Option<String>,
+        user_store_url: impl Into<String>,
         notebook_guid: Option<String>,
     ) -> Result<Self> {
         Ok(Self::with_http_client(
             token,
             note_store_url,
+            user_store_url,
             notebook_guid,
             ReqwestThriftHttpClient::new()?,
         ))
@@ -87,13 +92,16 @@ where
 {
     pub fn with_http_client(
         token: impl Into<String>,
-        note_store_url: impl Into<String>,
+        note_store_url: Option<String>,
+        user_store_url: impl Into<String>,
         notebook_guid: Option<String>,
         http: C,
     ) -> Self {
         Self {
             token: token.into(),
-            note_store_url: note_store_url.into(),
+            note_store_url,
+            user_store_url: user_store_url.into(),
+            resolved_note_store_url: Arc::new(Mutex::new(None)),
             notebook_guid,
             http,
         }
@@ -126,7 +134,8 @@ where
     fn note_store_client(
         &self,
     ) -> Result<NoteStoreSyncClient<InputProtocol<C>, OutputProtocol<C>>> {
-        let channel = ThriftHttpChannel::new(self.note_store_url.clone(), self.http.clone());
+        let note_store_url = self.note_store_url()?;
+        let channel = ThriftHttpChannel::new(note_store_url, self.http.clone());
         let (read, write) = channel
             .split()
             .map_err(|error| anyhow::anyhow!("failed to initialize Evernote transport: {error}"))?;
@@ -134,6 +143,51 @@ where
             TBinaryInputProtocol::new(read, true),
             TBinaryOutputProtocol::new(write, true),
         ))
+    }
+
+    fn user_store_client(
+        &self,
+    ) -> Result<UserStoreSyncClient<InputProtocol<C>, OutputProtocol<C>>> {
+        let channel = ThriftHttpChannel::new(self.user_store_url.clone(), self.http.clone());
+        let (read, write) = channel
+            .split()
+            .map_err(|error| anyhow::anyhow!("failed to initialize Evernote transport: {error}"))?;
+        Ok(UserStoreSyncClient::new(
+            TBinaryInputProtocol::new(read, true),
+            TBinaryOutputProtocol::new(write, true),
+        ))
+    }
+
+    fn note_store_url(&self) -> Result<String> {
+        if let Some(note_store_url) = &self.note_store_url {
+            return Ok(note_store_url.clone());
+        }
+
+        if let Some(note_store_url) = self
+            .resolved_note_store_url
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Evernote NoteStore URL cache is poisoned"))?
+            .clone()
+        {
+            return Ok(note_store_url);
+        }
+
+        let note_store_url = self.fetch_note_store_url()?;
+        *self
+            .resolved_note_store_url
+            .lock()
+            .map_err(|_| anyhow::anyhow!("Evernote NoteStore URL cache is poisoned"))? =
+            Some(note_store_url.clone());
+        Ok(note_store_url)
+    }
+
+    fn fetch_note_store_url(&self) -> Result<String> {
+        let mut client = self.user_store_client()?;
+        let urls = client
+            .get_user_urls(self.token.clone())
+            .map_err(|error| anyhow::anyhow!("Evernote UserStore API error: {error}"))?;
+        urls.note_store_url
+            .context("Evernote UserStore did not return a NoteStore URL")
     }
 }
 
@@ -243,13 +297,17 @@ mod tests {
     use std::collections::VecDeque;
     use std::io::Cursor;
 
-    use evernote::note_store;
+    use evernote::{note_store, user_store};
     use pretty_assertions::assert_eq;
-    use thrift::protocol::{TInputProtocol, TMessageIdentifier, TMessageType, TOutputProtocol};
+    use thrift::protocol::{
+        TFieldIdentifier, TInputProtocol, TMessageIdentifier, TMessageType, TOutputProtocol,
+        TSerializable, TStructIdentifier, TType,
+    };
 
     use super::*;
 
     const NOTE_STORE_URL: &str = "https://www.evernote.com/shard/s1/notestore";
+    const USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
 
     #[derive(Clone, Default)]
     struct MockHttpClient {
@@ -323,6 +381,9 @@ mod tests {
                     .map_err(|error| error.to_string())?,
             )
         } else {
+            protocol
+                .skip(TType::Struct)
+                .map_err(|error| error.to_string())?;
             None
         };
         protocol
@@ -365,13 +426,40 @@ mod tests {
         })
     }
 
+    fn user_urls_response(note_store_url: &str) -> Vec<u8> {
+        let urls = user_store::UserUrls {
+            note_store_url: Some(note_store_url.to_string()),
+            ..user_store::UserUrls::default()
+        };
+        thrift_response("getUserUrls", |protocol| {
+            protocol
+                .write_struct_begin(&TStructIdentifier::new("UserStoreGetUserUrlsResult"))
+                .expect("write getUserUrls result begin");
+            protocol
+                .write_field_begin(&TFieldIdentifier::new("result_value", TType::Struct, 0))
+                .expect("write getUserUrls result field begin");
+            urls.write_to_out_protocol(protocol)
+                .expect("write UserUrls result");
+            protocol
+                .write_field_end()
+                .expect("write getUserUrls result field end");
+            protocol
+                .write_field_stop()
+                .expect("write getUserUrls result field stop");
+            protocol
+                .write_struct_end()
+                .expect("write getUserUrls result end");
+        })
+    }
+
     #[test]
     fn create_track_note_sends_create_note_request() {
         let http = MockHttpClient::default();
         http.push_response(create_note_response("note-guid"));
         let client = EvernoteClient::with_http_client(
             "token",
-            NOTE_STORE_URL,
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
             Some("notebook-guid".to_string()),
             http.clone(),
         );
@@ -399,6 +487,48 @@ mod tests {
         assert_eq!(
             requests[0].note.tag_names.as_ref().unwrap(),
             &vec!["yandex-music".to_string()]
+        );
+    }
+
+    #[test]
+    fn create_track_note_discovers_note_store_url_when_missing() {
+        let http = MockHttpClient::default();
+        http.push_response(user_urls_response(NOTE_STORE_URL));
+        http.push_response(create_note_response("first-note-guid"));
+        http.push_response(create_note_response("second-note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            None,
+            USER_STORE_URL,
+            Some("notebook-guid".to_string()),
+            http.clone(),
+        );
+
+        let first_guid = client
+            .create_track_note("First".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect("create first note");
+        let second_guid = client
+            .create_track_note("Second".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect("create second note");
+
+        assert_eq!(first_guid, "first-note-guid");
+        assert_eq!(second_guid, "second-note-guid");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: USER_STORE_URL.to_string(),
+                    method: "getUserUrls".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                }
+            ]
         );
     }
 }

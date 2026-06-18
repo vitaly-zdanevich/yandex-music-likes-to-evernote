@@ -10,11 +10,15 @@ Set these GitHub Actions repository secrets:
 
 - `YANDEX_MUSIC_TOKEN`: Yandex Music OAuth token.
 - `EVERNOTE_AUTH_TOKEN`: Evernote OAuth/developer auth token with note write access.
-- `EVERNOTE_NOTE_STORE_URL`: Evernote NoteStore URL for your account. The developer token page shows this value for developer tokens; OAuth flows also return account-specific service URLs.
 - `GENIUS_ACCESS_TOKEN`: optional Genius API token. Without it, the tool adds a Genius search link instead of resolving a matched song URL.
+
+Optional GitHub Actions repository secrets or variables:
+
+- `EVERNOTE_NOTE_STORE_URL`: account-specific Evernote NoteStore URL. If omitted, the tool asks Evernote UserStore for the right NoteStore URL using `EVERNOTE_AUTH_TOKEN`.
 
 Optional GitHub Actions repository variables:
 
+- `EVERNOTE_USER_STORE_URL`: Evernote UserStore URL used for NoteStore discovery. Defaults to `https://www.evernote.com/edam/user`.
 - `EVERNOTE_NOTEBOOK_GUID`: target notebook GUID. If omitted, Evernote uses the default notebook.
 - `STATE_PATH`: state JSON file path. Defaults to `state.json`.
 - `DRY_RUN`: set to `true` to print notes without creating them.

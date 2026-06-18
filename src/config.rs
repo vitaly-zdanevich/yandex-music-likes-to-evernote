@@ -3,6 +3,8 @@ use std::path::PathBuf;
 use anyhow::{Result, anyhow};
 use clap::Parser;
 
+pub const DEFAULT_EVERNOTE_USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
+
 #[derive(Debug, Clone, Parser)]
 pub struct Settings {
     #[arg(long, env = "YANDEX_MUSIC_TOKEN")]
@@ -10,7 +12,13 @@ pub struct Settings {
     #[arg(long, env = "EVERNOTE_AUTH_TOKEN")]
     pub evernote_auth_token: String,
     #[arg(long, env = "EVERNOTE_NOTE_STORE_URL")]
-    pub evernote_note_store_url: String,
+    pub evernote_note_store_url: Option<String>,
+    #[arg(
+        long,
+        env = "EVERNOTE_USER_STORE_URL",
+        default_value = "https://www.evernote.com/edam/user"
+    )]
+    pub evernote_user_store_url: String,
     #[arg(long, env = "EVERNOTE_NOTEBOOK_GUID")]
     pub evernote_notebook_guid: Option<String>,
     #[arg(long, env = "STATE_PATH", default_value = "state.json")]
@@ -36,7 +44,12 @@ impl Settings {
     fn validate(mut self) -> Result<Self> {
         require_non_empty("YANDEX_MUSIC_TOKEN", &self.yandex_music_token)?;
         require_non_empty("EVERNOTE_AUTH_TOKEN", &self.evernote_auth_token)?;
-        require_non_empty("EVERNOTE_NOTE_STORE_URL", &self.evernote_note_store_url)?;
+        self.evernote_note_store_url = self
+            .evernote_note_store_url
+            .map(|url| url.trim().to_string())
+            .filter(|url| !url.is_empty());
+        self.evernote_user_store_url = self.evernote_user_store_url.trim().to_string();
+        require_non_empty("EVERNOTE_USER_STORE_URL", &self.evernote_user_store_url)?;
         self.evernote_notebook_guid = self
             .evernote_notebook_guid
             .map(|guid| guid.trim().to_string())
@@ -65,4 +78,46 @@ fn require_non_empty(name: &str, value: &str) -> Result<()> {
         return Err(anyhow!("{name} must not be empty"));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn base_settings() -> Settings {
+        Settings {
+            yandex_music_token: "yandex-token".to_string(),
+            evernote_auth_token: "evernote-token".to_string(),
+            evernote_note_store_url: None,
+            evernote_user_store_url: DEFAULT_EVERNOTE_USER_STORE_URL.to_string(),
+            evernote_notebook_guid: None,
+            state_path: "state.json".into(),
+            dry_run: false,
+            max_tracks_per_run: 10,
+            enrich_external_links: true,
+            genius_access_token: None,
+            songlink_user_country: "US".to_string(),
+        }
+    }
+
+    #[test]
+    fn note_store_url_is_optional() {
+        let settings = base_settings().validate().expect("valid settings");
+
+        assert_eq!(settings.evernote_note_store_url, None);
+        assert_eq!(
+            settings.evernote_user_store_url,
+            DEFAULT_EVERNOTE_USER_STORE_URL
+        );
+    }
+
+    #[test]
+    fn empty_note_store_url_is_treated_as_missing() {
+        let mut settings = base_settings();
+        settings.evernote_note_store_url = Some("  ".to_string());
+
+        let settings = settings.validate().expect("valid settings");
+
+        assert_eq!(settings.evernote_note_store_url, None);
+    }
 }
