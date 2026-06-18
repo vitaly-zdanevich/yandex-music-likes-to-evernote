@@ -5,6 +5,7 @@ use clap::Parser;
 
 pub const DEFAULT_EVERNOTE_USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
 pub const DEFAULT_EVERNOTE_TAG: &str = "yandex-music";
+pub const DEFAULT_MAX_TRACKS_PER_RUN: usize = 30;
 
 #[derive(Debug, Clone, Parser)]
 pub struct Settings {
@@ -28,7 +29,7 @@ pub struct Settings {
     pub state_path: PathBuf,
     #[arg(long, env = "DRY_RUN", default_value_t = false)]
     pub dry_run: bool,
-    #[arg(long, env = "MAX_TRACKS_PER_RUN", default_value_t = 10)]
+    #[arg(long, env = "MAX_TRACKS_PER_RUN", default_value_t = DEFAULT_MAX_TRACKS_PER_RUN)]
     pub max_tracks_per_run: usize,
     #[arg(long, env = "ENRICH_EXTERNAL_LINKS", default_value_t = true)]
     pub enrich_external_links: bool,
@@ -115,7 +116,7 @@ mod tests {
             evernote_tags: DEFAULT_EVERNOTE_TAG.to_string(),
             state_path: "state.json".into(),
             dry_run: false,
-            max_tracks_per_run: 10,
+            max_tracks_per_run: DEFAULT_MAX_TRACKS_PER_RUN,
             enrich_external_links: true,
             genius_access_token: None,
             songlink_user_country: "US".to_string(),

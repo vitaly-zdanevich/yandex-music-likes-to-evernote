@@ -27,7 +27,7 @@ jobs:
       GENIUS_ACCESS_TOKEN: ${{ secrets.GENIUS_ACCESS_TOKEN }}
       STATE_PATH: ${{ vars.STATE_PATH || 'state.json' }}
       DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
-      MAX_TRACKS_PER_RUN: ${{ vars.MAX_TRACKS_PER_RUN || '10' }}
+      MAX_TRACKS_PER_RUN: ${{ vars.MAX_TRACKS_PER_RUN || '30' }}
       ENRICH_EXTERNAL_LINKS: ${{ vars.ENRICH_EXTERNAL_LINKS || 'true' }}
       SONGLINK_USER_COUNTRY: ${{ vars.SONGLINK_USER_COUNTRY || 'US' }}
 
@@ -57,7 +57,7 @@ jobs:
       - name: Sync liked tracks
         run: |
           export DRY_RUN="${DRY_RUN:-false}"
-          export MAX_TRACKS_PER_RUN="${MAX_TRACKS_PER_RUN:-10}"
+          export MAX_TRACKS_PER_RUN="${MAX_TRACKS_PER_RUN:-30}"
           export ENRICH_EXTERNAL_LINKS="${ENRICH_EXTERNAL_LINKS:-true}"
           export SONGLINK_USER_COUNTRY="${SONGLINK_USER_COUNTRY:-US}"
           cargo run --locked -- sync

@@ -23,7 +23,7 @@ Optional GitHub Actions repository variables:
 - `EVERNOTE_NOTEBOOK_GUID`: target notebook GUID or exact notebook name. If omitted, Evernote uses the default notebook.
 - `STATE_PATH`: state JSON file path. Defaults to `state.json`.
 - `DRY_RUN`: set to `true` to print notes without creating them.
-- `MAX_TRACKS_PER_RUN`: cap created notes per run. Defaults to `10`.
+- `MAX_TRACKS_PER_RUN`: cap created notes per run. Defaults to `30`.
 - `ENRICH_EXTERNAL_LINKS`: add external MusicBrainz, LRCLIB, Songlink/Odesli, Wikidata, Wikipedia, YouTube, and Genius links. Defaults to `true`.
 - `SONGLINK_USER_COUNTRY`: optional two-letter country code for Songlink/Odesli lookup. Defaults to `US`.
 
@@ -31,7 +31,7 @@ External enrichment sends artist/title/album/link metadata to the selected publi
 
 ## First Run
 
-The first run is limited by `MAX_TRACKS_PER_RUN`, not by age. With the default configuration, it creates notes for up to `10` previously unprocessed liked tracks. Increase `MAX_TRACKS_PER_RUN` if you want a larger initial backfill.
+The first run is limited by `MAX_TRACKS_PER_RUN`, not by age. With the default configuration, it creates notes for up to `30` previously unprocessed liked tracks. Increase `MAX_TRACKS_PER_RUN` if you want a larger initial backfill.
 
 ## GitHub Actions Schedule
 
