@@ -31,10 +31,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
 
       - name: Restore sync state
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v5
         with:
           path: ${{ env.STATE_PATH }}
           key: yandex-music-state-${{ github.run_id }}-${{ github.run_attempt }}
@@ -42,7 +42,7 @@ jobs:
             yandex-music-state-
 
       - name: Cache Rust build
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/git
@@ -68,14 +68,14 @@ jobs:
 
       - name: Save sync state
         if: always()
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v5
         with:
           path: ${{ env.STATE_PATH }}
           key: yandex-music-state-${{ github.run_id }}-${{ github.run_attempt }}
 
       - name: Upload state artifact
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6
         with:
           name: state
           path: ${{ env.STATE_PATH }}
