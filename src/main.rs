@@ -24,8 +24,7 @@ enum Command {
     Sync,
 }
 
-#[tokio::main]
-async fn main() -> Result<()> {
+fn main() -> Result<()> {
     dotenvy::dotenv().ok();
     tracing_subscriber::fmt()
         .with_env_filter(
@@ -35,6 +34,6 @@ async fn main() -> Result<()> {
 
     let cli = Cli::parse();
     match cli.command {
-        Command::Sync => sync::run(Settings::from_env()?).await,
+        Command::Sync => sync::run(Settings::from_env()?),
     }
 }

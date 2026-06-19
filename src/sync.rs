@@ -1,4 +1,4 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{info, warn};
 
@@ -9,7 +9,8 @@ use crate::note;
 use crate::state::State;
 use crate::yandex::YandexClient;
 
-pub async fn run(settings: Settings) -> Result<()> {
+pub fn run(settings: Settings) -> Result<()> {
+    let runtime = tokio::runtime::Runtime::new().context("failed to create Tokio runtime")?;
     let mut state = State::load(&settings.state_path)?;
     let yandex = YandexClient::new(&settings.yandex_music_token)?;
     let evernote = EvernoteClient::new(
@@ -28,7 +29,7 @@ pub async fn run(settings: Settings) -> Result<()> {
         None
     };
 
-    let liked_tracks = yandex.liked_tracks().await?;
+    let liked_tracks = runtime.block_on(yandex.liked_tracks())?;
     let mut new_tracks = liked_tracks
         .into_iter()
         .filter(|track| !state.contains(&track.id))
@@ -48,7 +49,7 @@ pub async fn run(settings: Settings) -> Result<()> {
     for track in new_tracks {
         let title = note::title(&track);
         let external_links = if let Some(enrichment) = &enrichment {
-            enrichment.links_for(&track).await
+            runtime.block_on(enrichment.links_for(&track))
         } else {
             Vec::new()
         };
