@@ -14,9 +14,16 @@ pub struct LikedTrack {
     pub liked_at: DateTime<Utc>,
     pub title: String,
     pub artists: Vec<String>,
+    pub artist_links: Vec<ArtistLink>,
     pub albums: Vec<String>,
     pub duration_ms: Option<u128>,
     pub cover_url: Option<String>,
+    pub yandex_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ArtistLink {
+    pub name: String,
     pub yandex_url: String,
 }
 
@@ -162,6 +169,8 @@ struct RawTrack {
 
 #[derive(Debug, Deserialize)]
 struct RawArtist {
+    #[serde(default, deserialize_with = "optional_number_or_string_to_string")]
+    id: Option<String>,
     name: Option<String>,
 }
 
@@ -172,6 +181,7 @@ struct RawAlbum {
 
 fn to_liked_track(track: RawTrack, liked_at: DateTime<Utc>) -> LikedTrack {
     let artists = track.artists.iter().filter_map(artist_name).collect();
+    let artist_links = track.artists.iter().filter_map(artist_link).collect();
     let albums = track.albums.iter().filter_map(album_title).collect();
     let cover_url = track
         .cover_uri
@@ -186,6 +196,7 @@ fn to_liked_track(track: RawTrack, liked_at: DateTime<Utc>) -> LikedTrack {
         liked_at,
         title,
         artists,
+        artist_links,
         albums,
         duration_ms,
         cover_url,
@@ -200,6 +211,20 @@ fn artist_name(artist: &RawArtist) -> Option<String> {
         .map(str::trim)
         .filter(|name| !name.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn artist_link(artist: &RawArtist) -> Option<ArtistLink> {
+    let name = artist_name(artist)?;
+    let id = artist
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+
+    Some(ArtistLink {
+        name,
+        yandex_url: format!("https://music.yandex.com/artist/{id}"),
+    })
 }
 
 fn album_title(album: &RawAlbum) -> Option<String> {
@@ -229,6 +254,20 @@ where
         Value::Number(value) => Ok(value.to_string()),
         value => Err(serde::de::Error::custom(format!(
             "expected string or number, got {value}"
+        ))),
+    }
+}
+
+fn optional_number_or_string_to_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: Deserializer<'de>,
+{
+    match Option::<Value>::deserialize(deserializer)? {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => Ok(Some(value)),
+        Some(Value::Number(value)) => Ok(Some(value.to_string())),
+        Some(value) => Err(serde::de::Error::custom(format!(
+            "expected string, number, or null, got {value}"
         ))),
     }
 }
@@ -272,7 +311,7 @@ mod tests {
             r#"{
                 "id": 123,
                 "title": "Track Title",
-                "artists": [{"name": "Artist"}],
+                "artists": [{"id": 456, "name": "Artist"}],
                 "albums": [{"title": "Album"}],
                 "coverUri": "avatars.yandex.net/get-music-content/1/abc%%",
                 "durationMs": 123000,
@@ -291,6 +330,13 @@ mod tests {
         assert_eq!(track.id, "123");
         assert_eq!(track.title, "Track Title");
         assert_eq!(track.artists, vec!["Artist"]);
+        assert_eq!(
+            track.artist_links,
+            vec![ArtistLink {
+                name: "Artist".to_string(),
+                yandex_url: "https://music.yandex.com/artist/456".to_string(),
+            }]
+        );
         assert_eq!(track.albums, vec!["Album"]);
         assert_eq!(track.duration_ms, Some(123000));
     }
@@ -301,7 +347,7 @@ mod tests {
             r#"{
                 "id": "track-id",
                 "title": null,
-                "artists": [{"name": "  "}, {"name": "Artist"}],
+                "artists": [{"id": 123, "name": "  "}, {"id": "artist-id", "name": "Artist"}],
                 "albums": [{"title": ""}, {"title": "Album"}],
                 "ogImage": "https://example.test/cover.jpg",
                 "durationMs": "45000"
@@ -317,6 +363,13 @@ mod tests {
         assert_eq!(track.id, "track-id");
         assert_eq!(track.title, "Track track-id");
         assert_eq!(track.artists, vec!["Artist"]);
+        assert_eq!(
+            track.artist_links,
+            vec![ArtistLink {
+                name: "Artist".to_string(),
+                yandex_url: "https://music.yandex.com/artist/artist-id".to_string(),
+            }]
+        );
         assert_eq!(track.albums, vec!["Album"]);
         assert_eq!(
             track.cover_url.as_deref(),

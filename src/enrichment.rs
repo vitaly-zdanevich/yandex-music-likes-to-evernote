@@ -474,6 +474,7 @@ mod tests {
             liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
             title: "Song & Name".to_string(),
             artists: vec!["Artist Name".to_string()],
+            artist_links: Vec::new(),
             albums: vec!["Album Name".to_string()],
             duration_ms: Some(123_000),
             cover_url: None,

@@ -13,12 +13,11 @@ pub fn title(track: &LikedTrack) -> String {
 }
 
 pub fn enml(track: &LikedTrack, external_links: &[ExternalLink]) -> String {
-    let artist_list = display_list(&track.artists);
     let album_list = display_list(&track.albums);
     let liked_at_rfc3339 = track.liked_at.to_rfc3339();
     let track_id = encode_safe(&track.id);
     let title = encode_safe(&track.title);
-    let artists = encode_safe(&artist_list);
+    let artists = render_artists(track);
     let albums = encode_safe(&album_list);
     let liked_at = encode_safe(&liked_at_rfc3339);
     let url = encode_safe(&track.yandex_url);
@@ -50,8 +49,6 @@ pub fn enml(track: &LikedTrack, external_links: &[ExternalLink]) -> String {
 <div><b>Yandex Music:</b> <a href="{url}">{url}</a></div>
 {cover}
 {external_links}
-<div><br/></div>
-<div>Audio is not copied by this tool; this note stores metadata and links only.</div>
 </en-note>"#
     )
 }
@@ -65,6 +62,27 @@ fn format_duration(duration_ms: u128) -> String {
     let minutes = total_seconds / 60;
     let seconds = total_seconds % 60;
     format!("{minutes}:{seconds:02}")
+}
+
+fn render_artists(track: &LikedTrack) -> String {
+    if track.artist_links.is_empty() {
+        return encode_safe(&display_list(&track.artists)).into_owned();
+    }
+
+    track
+        .artists
+        .iter()
+        .map(|artist| {
+            if let Some(link) = track.artist_links.iter().find(|link| link.name == *artist) {
+                let name = encode_safe(artist);
+                let url = encode_safe(&link.yandex_url);
+                format!("<a href=\"{url}\">{name}</a>")
+            } else {
+                encode_safe(artist).into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn render_external_links(links: &[ExternalLink]) -> String {
@@ -90,6 +108,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::yandex::ArtistLink;
 
     #[test]
     fn renders_enml_with_escaped_values() {
@@ -98,6 +117,10 @@ mod tests {
             liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
             title: "A < B".to_string(),
             artists: vec!["Artist & Co".to_string()],
+            artist_links: vec![ArtistLink {
+                name: "Artist & Co".to_string(),
+                yandex_url: "https://music.yandex.com/artist/42".to_string(),
+            }],
             albums: vec!["Album".to_string()],
             duration_ms: Some(123_000),
             cover_url: Some("https://example.com/a?b=1&c=2".to_string()),
@@ -112,11 +135,14 @@ mod tests {
 
         assert!(enml.contains("A &lt; B"));
         assert!(enml.contains("<div><b>Track ID:</b> 1</div>"));
-        assert!(enml.contains("Artist &amp; Co"));
+        assert!(enml.contains(
+            r#"<div><b>Artist:</b> <a href="https:&#x2F;&#x2F;music.yandex.com&#x2F;artist&#x2F;42">Artist &amp; Co</a></div>"#
+        ));
         assert!(enml.contains("2:03"));
         assert!(enml.contains("External links"));
         assert!(enml.contains("MusicBrainz recording search"));
         assert!(enml.contains("musicbrainz.org"));
+        assert!(!enml.contains("Audio is not copied by this tool"));
     }
 
     #[test]
@@ -126,6 +152,7 @@ mod tests {
             liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
             title: "Solo Track".to_string(),
             artists: Vec::new(),
+            artist_links: Vec::new(),
             albums: Vec::new(),
             duration_ms: None,
             cover_url: None,
