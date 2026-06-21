@@ -63,13 +63,20 @@ pub fn enml(
 fn render_audio(audio: &AudioAttachment) -> String {
     let human_size = audio.human_size();
     let file_name = encode_safe(&audio.file_name);
-    let quality = encode_safe(&audio.quality);
-    let size = encode_safe(&human_size);
     let mime = encode_safe(&audio.mime);
     let hash = audio.md5_hex();
-    let bitrate = audio.bitrate_kbps;
+
+    // Yandex reports no bitrate for lossless flac-mp4 streams, so only show it
+    // when known to avoid a misleading "0 kbps".
+    let mut details = vec![encode_safe(&audio.quality).into_owned()];
+    if audio.bitrate_kbps > 0 {
+        details.push(format!("{} kbps", audio.bitrate_kbps));
+    }
+    details.push(encode_safe(&human_size).into_owned());
+    let details = details.join(", ");
+
     format!(
-        "<div><b>Audio:</b> {file_name} ({quality}, {bitrate} kbps, {size})</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>"
+        "<div><b>Audio:</b> {file_name} ({details})</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>"
     )
 }
 
@@ -221,5 +228,35 @@ mod tests {
         assert!(enml.contains(
             r#"<en-media type="audio&#x2F;flac" hash="5d41402abc4b2a76b9719d911017c592"/>"#
         ));
+    }
+
+    #[test]
+    fn omits_bitrate_when_zero_for_lossless_flac_mp4() {
+        let track = LikedTrack {
+            id: "4".to_string(),
+            liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            title: "Ethnicolor".to_string(),
+            artists: vec!["Jean-Michel Jarre".to_string()],
+            artist_links: Vec::new(),
+            albums: Vec::new(),
+            duration_ms: None,
+            cover_url: None,
+            yandex_url: "https://music.yandex.com/track/4".to_string(),
+        };
+        let audio = AudioAttachment::new(
+            TrackAudio {
+                bytes: b"abc".to_vec(),
+                codec: "flac-mp4".to_string(),
+                bitrate_kbps: 0,
+                quality: "lossless".to_string(),
+            },
+            &title(&track),
+        );
+
+        let enml = enml(&track, &[], Some(&audio));
+
+        assert!(enml.contains("<b>Audio:</b> Jean-Michel Jarre - Ethnicolor.mp4 (lossless, 3 B)"));
+        assert!(!enml.contains("kbps"));
+        assert!(enml.contains(r#"<en-media type="audio&#x2F;mp4""#));
     }
 }
