@@ -212,6 +212,23 @@ fn musicbrainz_recording_matches(recording: &MusicBrainzRecording, track: &Liked
 
 fn wikimedia_links(track: &LikedTrack) -> Vec<ExternalLink> {
     let mut links = Vec::new();
+
+    let track_query = if let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    {
+        format!("{artist} {}", track.title)
+    } else {
+        track.title.clone()
+    };
+    if !track_query.trim().is_empty() {
+        links.push(ExternalLink::new(
+            "Wikidata track search",
+            wikidata_search_url(&track_query),
+        ));
+    }
+
     if let Some(artist) = track
         .artists
         .first()
@@ -530,7 +547,23 @@ mod tests {
             lrclib_get_url(&track),
             "https://lrclib.net/api/get?track_name=Song+%26+Name&artist_name=&album_name="
         );
-        assert!(wikimedia_links(&track).is_empty());
+        assert_eq!(
+            wikimedia_links(&track),
+            vec![ExternalLink::new(
+                "Wikidata track search",
+                "https://www.wikidata.org/w/index.php?search=Song+%26+Name"
+            )]
+        );
+    }
+
+    #[test]
+    fn builds_wikidata_track_search_with_artist_context() {
+        let track = sample_track();
+
+        assert!(wikimedia_links(&track).contains(&ExternalLink::new(
+            "Wikidata track search",
+            "https://www.wikidata.org/w/index.php?search=Artist+Name+Song+%26+Name"
+        )));
     }
 
     #[test]
