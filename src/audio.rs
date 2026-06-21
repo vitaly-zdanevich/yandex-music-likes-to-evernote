@@ -71,6 +71,26 @@ impl AudioAttachment {
     pub fn human_size(&self) -> String {
         human_size(self.body.len())
     }
+
+    /// Bitrate to display, in kbps. Returns the value Yandex reported, or—when it
+    /// reports none (lossless flac-mp4 comes back with bitrate 0)—the average
+    /// bitrate derived from the file size and track duration. The bool marks an
+    /// estimated (averaged) value.
+    pub fn display_bitrate_kbps(&self, duration_ms: Option<u128>) -> Option<(u32, bool)> {
+        if self.bitrate_kbps > 0 {
+            return Some((self.bitrate_kbps, false));
+        }
+        let duration_ms = duration_ms.filter(|ms| *ms > 0)?;
+        if self.body.is_empty() {
+            return None;
+        }
+        // bytes * 8 bits / (duration_ms / 1000) s / 1000 == bytes * 8 / duration_ms (kbps).
+        let kbps = (self.body.len() as u128 * 8) / duration_ms;
+        u32::try_from(kbps)
+            .ok()
+            .filter(|kbps| *kbps > 0)
+            .map(|kbps| (kbps, true))
+    }
 }
 
 fn codec_extension(codec: &str) -> &'static str {

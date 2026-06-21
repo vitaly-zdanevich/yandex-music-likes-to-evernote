@@ -40,7 +40,9 @@ pub fn enml(
         })
         .unwrap_or_default();
     let external_links = render_external_links(external_links);
-    let audio = audio.map(render_audio).unwrap_or_default();
+    let audio = audio
+        .map(|audio| render_audio(audio, track.duration_ms))
+        .unwrap_or_default();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -60,17 +62,18 @@ pub fn enml(
     )
 }
 
-fn render_audio(audio: &AudioAttachment) -> String {
+fn render_audio(audio: &AudioAttachment, duration_ms: Option<u128>) -> String {
     let human_size = audio.human_size();
     let file_name = encode_safe(&audio.file_name);
     let mime = encode_safe(&audio.mime);
     let hash = audio.md5_hex();
 
-    // Yandex reports no bitrate for lossless flac-mp4 streams, so only show it
-    // when known to avoid a misleading "0 kbps".
+    // Yandex reports no bitrate for lossless flac-mp4, so fall back to the average
+    // bitrate derived from size and duration (marked with `~`) instead of "0 kbps".
     let mut details = vec![encode_safe(&audio.quality).into_owned()];
-    if audio.bitrate_kbps > 0 {
-        details.push(format!("{} kbps", audio.bitrate_kbps));
+    if let Some((kbps, estimated)) = audio.display_bitrate_kbps(duration_ms) {
+        let prefix = if estimated { "~" } else { "" };
+        details.push(format!("{prefix}{kbps} kbps"));
     }
     details.push(encode_safe(&human_size).into_owned());
     let details = details.join(", ");
@@ -231,7 +234,7 @@ mod tests {
     }
 
     #[test]
-    fn omits_bitrate_when_zero_for_lossless_flac_mp4() {
+    fn omits_bitrate_when_unknown_and_duration_missing() {
         let track = LikedTrack {
             id: "4".to_string(),
             liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
@@ -258,5 +261,34 @@ mod tests {
         assert!(enml.contains("<b>Audio:</b> Jean-Michel Jarre - Ethnicolor.mp4 (lossless, 3 B)"));
         assert!(!enml.contains("kbps"));
         assert!(enml.contains(r#"<en-media type="audio&#x2F;mp4""#));
+    }
+
+    #[test]
+    fn estimates_lossless_bitrate_from_duration() {
+        let track = LikedTrack {
+            id: "5".to_string(),
+            liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            title: "Ethnicolor".to_string(),
+            artists: vec!["Jean-Michel Jarre".to_string()],
+            artist_links: Vec::new(),
+            albums: Vec::new(),
+            duration_ms: Some(1_000),
+            cover_url: None,
+            yandex_url: "https://music.yandex.com/track/5".to_string(),
+        };
+        let audio = AudioAttachment::new(
+            TrackAudio {
+                // 100000 bytes * 8 bits / 1000 ms = 800 kbps.
+                bytes: vec![0u8; 100_000],
+                codec: "flac-mp4".to_string(),
+                bitrate_kbps: 0,
+                quality: "lossless".to_string(),
+            },
+            &title(&track),
+        );
+
+        let enml = enml(&track, &[], Some(&audio));
+
+        assert!(enml.contains("(lossless, ~800 kbps,"), "got: {enml}");
     }
 }
