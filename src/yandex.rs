@@ -473,4 +473,79 @@ mod tests {
 
         assert!(error.to_string().contains("expected string or number"));
     }
+
+    /// Manual end-to-end smoke test against the live Yandex Music API. Excluded
+    /// from normal/CI runs (`#[ignore]`); needs `YANDEX_MUSIC_TOKEN` in the
+    /// environment or a local `.env`. Downloads one liked track to verify the
+    /// pipeline, then summarizes the audio quality the account is served across a
+    /// sample of the library (handy for re-checking after a subscription change).
+    ///   cargo test live_audio_smoke -- --ignored --nocapture
+    #[tokio::test]
+    #[ignore = "hits the live Yandex Music API; needs YANDEX_MUSIC_TOKEN"]
+    async fn live_audio_smoke() {
+        dotenvy::dotenv().ok();
+        let token = match std::env::var("YANDEX_MUSIC_TOKEN") {
+            Ok(token) if !token.trim().is_empty() => token,
+            _ => {
+                eprintln!("skipping: YANDEX_MUSIC_TOKEN not set");
+                return;
+            }
+        };
+
+        let client = YandexClient::new(&token).expect("build client");
+        let tracks = client.liked_tracks().await.expect("liked tracks");
+        assert!(!tracks.is_empty(), "no liked tracks to test with");
+        eprintln!("library: {} liked tracks", tracks.len());
+
+        // 1) Download one track end-to-end and verify it is non-empty audio.
+        let track = tracks.first().expect("a liked track");
+        let audio = client
+            .download_audio(&track.id)
+            .await
+            .expect("download")
+            .expect("audio available");
+        let attachment =
+            crate::audio::AudioAttachment::new(audio.clone(), &crate::note::title(track));
+        let magic: Vec<String> = audio
+            .bytes
+            .iter()
+            .take(4)
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        eprintln!(
+            "downloaded {} - {}\n  quality={} codec={} size={} file={} mime={} magic=[{}]",
+            track.artists.join(", "),
+            track.title,
+            audio.quality,
+            audio.codec,
+            attachment.human_size(),
+            attachment.file_name,
+            attachment.mime,
+            magic.join(" "),
+        );
+        assert!(
+            !audio.bytes.is_empty(),
+            "downloaded audio should not be empty"
+        );
+
+        // 2) Summarize the lossless-tier format served across a sample of likes.
+        let sample = 30.min(tracks.len());
+        let mut counts: std::collections::BTreeMap<String, usize> =
+            std::collections::BTreeMap::new();
+        for track in tracks.iter().rev().take(sample) {
+            let options = GetFileInfoOptions::new(&track.id).quality(Quality::Lossless);
+            match client.inner.get_file_info(&options).await {
+                Ok(info) => {
+                    *counts
+                        .entry(format!("{} {}", info.quality, info.codec))
+                        .or_default() += 1;
+                }
+                Err(error) => eprintln!("  file-info error for track {}: {error}", track.id),
+            }
+        }
+        eprintln!("lossless-tier format across {sample} newest tracks (quality codec : count):");
+        for (format, count) in &counts {
+            eprintln!("  {format}: {count}");
+        }
+    }
 }

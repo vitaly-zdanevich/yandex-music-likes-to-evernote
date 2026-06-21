@@ -67,3 +67,11 @@ Use dry-run mode first:
 ```bash
 DRY_RUN=true cargo run -- sync
 ```
+
+### Audio smoke test
+
+To check the audio download path against the live API without creating any Evernote notes, set `YANDEX_MUSIC_TOKEN` in `.env` and run the `#[ignore]`d smoke test. It downloads one liked track (verifying format/size/integrity) and summarizes the quality your account is served across a sample of the library — useful after a subscription change:
+
+```bash
+cargo test live_audio_smoke -- --ignored --nocapture
+```
