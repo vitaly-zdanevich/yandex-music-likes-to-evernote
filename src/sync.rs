@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{info, warn};
 
+use crate::audio::AudioAttachment;
 use crate::config::Settings;
 use crate::enrichment::EnrichmentClient;
 use crate::evernote_client::EvernoteClient;
@@ -53,25 +54,46 @@ pub fn run(settings: Settings) -> Result<()> {
         } else {
             Vec::new()
         };
-        let content = note::enml(&track, &external_links);
 
         if settings.dry_run {
             info!(
                 track_id = track.id,
                 title = title,
                 url = track.yandex_url,
+                backup_audio = settings.backup_audio,
                 "dry-run: would create Evernote note"
             );
             continue;
-        } else {
-            let guid = evernote.create_track_note(title.clone(), content)?;
-            info!(
-                track_id = track.id,
-                evernote_guid = guid,
-                title = title,
-                "created Evernote note"
-            );
         }
+
+        let audio = if settings.backup_audio {
+            match runtime.block_on(yandex.download_audio(&track.id)) {
+                Ok(audio) => audio.map(|audio| AudioAttachment::new(audio, &title)),
+                Err(error) => {
+                    // Transient failure (e.g. a flaky download host): leave the
+                    // track unprocessed so the next run retries it with audio
+                    // rather than creating a permanent audio-less note.
+                    warn!(
+                        track_id = track.id,
+                        error = format!("{error:#}"),
+                        "audio download failed; leaving track for the next run"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            None
+        };
+
+        let content = note::enml(&track, &external_links, audio.as_ref());
+        let guid = evernote.create_track_note(title.clone(), content, audio.as_ref())?;
+        info!(
+            track_id = track.id,
+            evernote_guid = guid,
+            title = title,
+            audio_attached = audio.is_some(),
+            "created Evernote note"
+        );
 
         state.mark_processed(track.id);
         state.save(&settings.state_path)?;

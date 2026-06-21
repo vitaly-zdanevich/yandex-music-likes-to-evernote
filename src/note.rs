@@ -1,5 +1,6 @@
 use html_escape::encode_safe;
 
+use crate::audio::AudioAttachment;
 use crate::enrichment::ExternalLink;
 use crate::yandex::LikedTrack;
 
@@ -12,7 +13,11 @@ pub fn title(track: &LikedTrack) -> String {
     }
 }
 
-pub fn enml(track: &LikedTrack, external_links: &[ExternalLink]) -> String {
+pub fn enml(
+    track: &LikedTrack,
+    external_links: &[ExternalLink],
+    audio: Option<&AudioAttachment>,
+) -> String {
     let album_list = display_list(&track.albums);
     let liked_at_rfc3339 = track.liked_at.to_rfc3339();
     let track_id = encode_safe(&track.id);
@@ -35,6 +40,7 @@ pub fn enml(track: &LikedTrack, external_links: &[ExternalLink]) -> String {
         })
         .unwrap_or_default();
     let external_links = render_external_links(external_links);
+    let audio = audio.map(render_audio).unwrap_or_default();
 
     format!(
         r#"<?xml version="1.0" encoding="UTF-8"?>
@@ -48,8 +54,22 @@ pub fn enml(track: &LikedTrack, external_links: &[ExternalLink]) -> String {
 <div><b>Liked at:</b> {liked_at}</div>
 <div><b>Yandex Music:</b> <a href="{url}">{url}</a></div>
 {cover}
+{audio}
 {external_links}
 </en-note>"#
+    )
+}
+
+fn render_audio(audio: &AudioAttachment) -> String {
+    let human_size = audio.human_size();
+    let file_name = encode_safe(&audio.file_name);
+    let quality = encode_safe(&audio.quality);
+    let size = encode_safe(&human_size);
+    let mime = encode_safe(&audio.mime);
+    let hash = audio.md5_hex();
+    let bitrate = audio.bitrate_kbps;
+    format!(
+        "<div><b>Audio:</b> {file_name} ({quality}, {bitrate} kbps, {size})</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>"
     )
 }
 
@@ -108,6 +128,7 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
+    use crate::audio::TrackAudio;
     use crate::yandex::ArtistLink;
 
     #[test]
@@ -131,9 +152,10 @@ mod tests {
             label: "MusicBrainz recording search".to_string(),
             url: "https://musicbrainz.org/search?query=a&b=c".to_string(),
         }];
-        let enml = enml(&track, &links);
+        let enml = enml(&track, &links, None);
 
         assert!(enml.contains("A &lt; B"));
+        assert!(!enml.contains("<en-media"));
         assert!(enml.contains("<div><b>Track ID:</b> 1</div>"));
         assert!(enml.contains(
             r#"<div><b>Artist:</b> <a href="https:&#x2F;&#x2F;music.yandex.com&#x2F;artist&#x2F;42">Artist &amp; Co</a></div>"#
@@ -159,12 +181,45 @@ mod tests {
             yandex_url: "https://music.yandex.com/track/2".to_string(),
         };
 
-        let enml = enml(&track, &[]);
+        let enml = enml(&track, &[], None);
 
         assert_eq!(title(&track), "Solo Track");
         assert!(enml.contains("<div><b>Track:</b> Solo Track</div>"));
         assert!(!enml.contains("<b>Duration:</b>"));
         assert!(!enml.contains("<b>Cover:</b>"));
         assert!(!enml.contains("<b>External links:</b>"));
+        assert!(!enml.contains("<b>Audio:</b>"));
+        assert!(!enml.contains("<en-media"));
+    }
+
+    #[test]
+    fn renders_audio_attachment_media_tag() {
+        let track = LikedTrack {
+            id: "3".to_string(),
+            liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            title: "Song".to_string(),
+            artists: vec!["Artist".to_string()],
+            artist_links: Vec::new(),
+            albums: Vec::new(),
+            duration_ms: None,
+            cover_url: None,
+            yandex_url: "https://music.yandex.com/track/3".to_string(),
+        };
+        let audio = AudioAttachment::new(
+            TrackAudio {
+                bytes: b"hello".to_vec(),
+                codec: "flac".to_string(),
+                bitrate_kbps: 1411,
+                quality: "lossless".to_string(),
+            },
+            &title(&track),
+        );
+
+        let enml = enml(&track, &[], Some(&audio));
+
+        assert!(enml.contains("<b>Audio:</b> Artist - Song.flac (lossless, 1411 kbps, 5 B)"));
+        assert!(enml.contains(
+            r#"<en-media type="audio&#x2F;flac" hash="5d41402abc4b2a76b9719d911017c592"/>"#
+        ));
     }
 }

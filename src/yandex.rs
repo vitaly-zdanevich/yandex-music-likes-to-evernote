@@ -1,12 +1,25 @@
 use std::collections::HashMap;
+use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
+use tracing::warn;
 use yandex_music::{
-    API_PATH, YandexMusicClient, api::track::get_liked_tracks::GetLikedTracksOptions,
+    API_PATH, YandexMusicClient,
+    api::track::{get_file_info::GetFileInfoOptions, get_liked_tracks::GetLikedTracksOptions},
+    model::info::file_info::Quality,
 };
+
+use crate::audio::TrackAudio;
+
+const AUDIO_DOWNLOAD_USER_AGENT: &str = "yandex-music-likes-to-evernote/0.1";
+const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Audio qualities to try, best first. Lossless requires a Yandex Plus tier that
+/// grants it; otherwise we fall back to the best lossy stream the account allows.
+const AUDIO_QUALITIES: [Quality; 3] = [Quality::Lossless, Quality::Normal, Quality::Low];
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LikedTrack {
@@ -29,6 +42,7 @@ pub struct ArtistLink {
 
 pub struct YandexClient {
     inner: YandexMusicClient,
+    download_http: reqwest::Client,
 }
 
 impl YandexClient {
@@ -36,7 +50,18 @@ impl YandexClient {
         let inner = YandexMusicClient::builder(token)
             .build()
             .context("failed to build Yandex Music client")?;
-        Ok(Self { inner })
+        // A plain client without the API's `Authorization: OAuth` header: the
+        // file-info URLs point at signed storage hosts that can reject an
+        // unexpected Authorization header.
+        let download_http = reqwest::Client::builder()
+            .user_agent(AUDIO_DOWNLOAD_USER_AGENT)
+            .timeout(AUDIO_DOWNLOAD_TIMEOUT)
+            .build()
+            .context("failed to build Yandex Music audio download client")?;
+        Ok(Self {
+            inner,
+            download_http,
+        })
     }
 
     pub async fn liked_tracks(&self) -> Result<Vec<LikedTrack>> {
@@ -131,6 +156,65 @@ impl YandexClient {
             .collect();
 
         Ok(tracks)
+    }
+
+    /// Download a track's audio in the highest quality the account is entitled to,
+    /// without re-encoding. Returns `Ok(None)` when no quality is downloadable
+    /// (e.g. the track is not available for download for this account).
+    pub async fn download_audio(&self, track_id: &str) -> Result<Option<TrackAudio>> {
+        let mut last_error: Option<String> = None;
+
+        for quality in AUDIO_QUALITIES {
+            let options = GetFileInfoOptions::new(track_id).quality(quality);
+            let file_info = match self.inner.get_file_info(&options).await {
+                Ok(file_info) => file_info,
+                Err(error) => {
+                    last_error = Some(format!("{quality} quality unavailable: {error}"));
+                    continue;
+                }
+            };
+
+            let bytes = self
+                .download_file(&file_info.url)
+                .await
+                .with_context(|| format!("failed to download audio for track {track_id}"))?;
+
+            if file_info.size != 0 && bytes.len() as u64 != file_info.size {
+                warn!(
+                    track_id,
+                    expected = file_info.size,
+                    downloaded = bytes.len(),
+                    "downloaded audio size does not match the size reported by Yandex Music"
+                );
+            }
+
+            return Ok(Some(TrackAudio {
+                bytes,
+                codec: file_info.codec,
+                bitrate_kbps: file_info.bitrate,
+                quality: file_info.quality,
+            }));
+        }
+
+        if let Some(error) = last_error {
+            warn!(track_id, error, "no downloadable audio for track");
+        }
+        Ok(None)
+    }
+
+    async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
+        let bytes = self
+            .download_http
+            .get(url)
+            .send()
+            .await
+            .context("failed to request audio file")?
+            .error_for_status()
+            .context("audio file host returned an HTTP error")?
+            .bytes()
+            .await
+            .context("failed to read audio file body")?;
+        Ok(bytes.to_vec())
     }
 }
 

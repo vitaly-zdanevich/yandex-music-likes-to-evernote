@@ -4,8 +4,10 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 use evernote::note_store::{NoteStoreSyncClient, TNoteStoreSyncClient};
-use evernote::types::{self, NoteAttributes};
+use evernote::types::{self, Data, NoteAttributes, Resource, ResourceAttributes};
 use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
+
+use crate::audio::AudioAttachment;
 use reqwest::blocking::Client as ReqwestClient;
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{ReadHalf, TIoChannel, WriteHalf};
@@ -114,7 +116,12 @@ where
         }
     }
 
-    pub fn create_track_note(&self, title: String, content: String) -> Result<String> {
+    pub fn create_track_note(
+        &self,
+        title: String,
+        content: String,
+        audio: Option<&AudioAttachment>,
+    ) -> Result<String> {
         let notebook_guid = self.notebook_guid()?;
         let mut client = self.note_store_client()?;
         let note = types::Note {
@@ -127,6 +134,7 @@ where
                 ..NoteAttributes::default()
             }),
             tag_names: Some(self.tag_names.clone()),
+            resources: audio.map(|audio| vec![audio_resource(audio)]),
             ..types::Note::default()
         };
 
@@ -245,6 +253,23 @@ where
         notebook
             .guid
             .with_context(|| format!("Evernote notebook named '{name}' did not include a GUID"))
+    }
+}
+
+fn audio_resource(audio: &AudioAttachment) -> Resource {
+    Resource {
+        data: Some(Data {
+            body_hash: Some(audio.md5_raw()),
+            size: Some(i32::try_from(audio.size()).unwrap_or(i32::MAX)),
+            body: Some(audio.body.clone()),
+        }),
+        mime: Some(audio.mime.clone()),
+        attributes: Some(ResourceAttributes {
+            file_name: Some(audio.file_name.clone()),
+            attachment: Some(true),
+            ..ResourceAttributes::default()
+        }),
+        ..Resource::default()
     }
 }
 
@@ -374,6 +399,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::audio::TrackAudio;
 
     const NOTE_STORE_URL: &str = "https://www.evernote.com/shard/s1/notestore";
     const USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
@@ -567,7 +593,11 @@ mod tests {
         );
 
         let guid = client
-            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect("create note");
 
         assert_eq!(guid, "note-guid");
@@ -593,6 +623,63 @@ mod tests {
     }
 
     #[test]
+    fn create_track_note_attaches_audio_resource() {
+        let http = MockHttpClient::default();
+        http.push_response(create_note_response("note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+        let audio = AudioAttachment::new(
+            TrackAudio {
+                bytes: b"hello".to_vec(),
+                codec: "flac".to_string(),
+                bitrate_kbps: 1411,
+                quality: "lossless".to_string(),
+            },
+            "Artist - Title",
+        );
+
+        client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                Some(&audio),
+            )
+            .expect("create note");
+
+        let requests = http.create_requests();
+        assert_eq!(requests.len(), 1);
+        let resources = requests[0]
+            .note
+            .resources
+            .as_ref()
+            .expect("note should carry resources");
+        assert_eq!(resources.len(), 1);
+        let resource = &resources[0];
+        assert_eq!(resource.mime.as_deref(), Some("audio/flac"));
+        assert_eq!(
+            resource
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.file_name.as_deref()),
+            Some("Artist - Title.flac")
+        );
+        let data = resource.data.as_ref().expect("resource data");
+        assert_eq!(data.body.as_deref(), Some(b"hello".as_slice()));
+        assert_eq!(data.size, Some(5));
+        assert_eq!(
+            data.body_hash.as_ref().map(|hash| hash.len()),
+            Some(16),
+            "body hash should be a raw MD5 digest"
+        );
+    }
+
+    #[test]
     fn create_track_note_discovers_note_store_url_when_missing() {
         let http = MockHttpClient::default();
         http.push_response(user_urls_response(NOTE_STORE_URL));
@@ -608,10 +695,18 @@ mod tests {
         );
 
         let first_guid = client
-            .create_track_note("First".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "First".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect("create first note");
         let second_guid = client
-            .create_track_note("Second".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Second".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect("create second note");
 
         assert_eq!(first_guid, "first-note-guid");
@@ -662,10 +757,18 @@ mod tests {
         );
 
         let first_guid = client
-            .create_track_note("First".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "First".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect("create first note");
         let second_guid = client
-            .create_track_note("Second".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Second".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect("create second note");
 
         assert_eq!(first_guid, "first-note-guid");
@@ -713,7 +816,11 @@ mod tests {
         );
 
         let error = client
-            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect_err("missing note GUID should fail");
 
         assert_eq!(
@@ -740,7 +847,11 @@ mod tests {
         );
 
         let error = client
-            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect_err("missing notebook should fail");
 
         assert_eq!(
@@ -774,7 +885,11 @@ mod tests {
         );
 
         let error = client
-            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                None,
+            )
             .expect_err("duplicate notebook should fail");
 
         assert_eq!(

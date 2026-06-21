@@ -12,9 +12,9 @@
 [![Lines of Code](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=ncloc)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
 [![Technical Debt](https://sonarcloud.io/api/project_badges/measure?project=vitaly-zdanevich_yandex-music-likes-to-evernote&metric=sqale_index)](https://sonarcloud.io/summary/new_code?id=vitaly-zdanevich_yandex-music-likes-to-evernote)
 
-Rust CLI for a scheduled GitHub Actions job that exports newly liked Yandex Music tracks to Evernote as metadata notes.
+Rust CLI for a scheduled GitHub Actions job that backs up newly liked Yandex Music tracks to Evernote, one note per track.
 
-It does **not** download or copy Yandex Music catalog audio. Each Evernote note contains track metadata and links back to Yandex Music.
+Each note contains the track metadata and links back to Yandex Music. By default it **also attaches the track's audio file** to the note for personal backup: downloaded in the highest quality the account is entitled to and stored **without re-encoding** (lossless FLAC when your Yandex Plus tier allows it, otherwise the best available lossy stream). Set `BACKUP_AUDIO=false` for metadata-only notes.
 
 ## Configuration
 
@@ -36,6 +36,7 @@ Optional GitHub Actions repository variables:
 - `STATE_PATH`: state JSON file path. Defaults to `state.json`.
 - `DRY_RUN`: set to `true` to print notes without creating them.
 - `MAX_TRACKS_PER_RUN`: cap created notes per run. Set to `0` to disable the cap. Defaults to `30`.
+- `BACKUP_AUDIO`: download each track's audio in the highest available quality (no re-encoding) and attach it to its note. Defaults to `true`. Lossless FLAC requires a Yandex Plus subscription tier that grants it; otherwise the best available lossy stream is used. Attachments count against your Evernote note-size and monthly upload limits (a lossless track is typically 20–40 MB), so set this to `false` if you want metadata-only notes. If a download fails transiently, the track is left unprocessed and retried on the next run rather than saved without audio.
 - `ENRICH_EXTERNAL_LINKS`: add external MusicBrainz, LRCLIB, Songlink/Odesli, Wikidata, Wikipedia, YouTube, and Genius links. Defaults to `true`.
 - `SONGLINK_USER_COUNTRY`: optional two-letter country code for Songlink/Odesli lookup. Defaults to `US`.
 

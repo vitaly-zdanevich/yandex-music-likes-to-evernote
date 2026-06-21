@@ -2559,6 +2559,7 @@ dependencies = [
  "dotenvy",
  "evernote",
  "html-escape",
+ "md5",
  "pretty_assertions",
  "reqwest 0.12.28",
  "serde",

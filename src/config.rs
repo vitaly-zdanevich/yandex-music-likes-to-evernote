@@ -31,6 +31,8 @@ pub struct Settings {
     pub dry_run: bool,
     #[arg(long, env = "MAX_TRACKS_PER_RUN", default_value_t = DEFAULT_MAX_TRACKS_PER_RUN)]
     pub max_tracks_per_run: usize,
+    #[arg(long, env = "BACKUP_AUDIO", default_value_t = true)]
+    pub backup_audio: bool,
     #[arg(long, env = "ENRICH_EXTERNAL_LINKS", default_value_t = true)]
     pub enrich_external_links: bool,
     #[arg(long, env = "GENIUS_ACCESS_TOKEN")]
@@ -114,6 +116,7 @@ mod tests {
             state_path: "state.json".into(),
             dry_run: false,
             max_tracks_per_run: DEFAULT_MAX_TRACKS_PER_RUN,
+            backup_audio: true,
             enrich_external_links: true,
             genius_access_token: None,
             songlink_user_country: "US".to_string(),
