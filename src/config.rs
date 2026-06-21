@@ -65,9 +65,6 @@ impl Settings {
             .filter(|token| !token.is_empty());
         self.songlink_user_country = self.songlink_user_country.trim().to_uppercase();
 
-        if self.max_tracks_per_run == 0 {
-            return Err(anyhow!("MAX_TRACKS_PER_RUN must be greater than 0"));
-        }
         if self.songlink_user_country.len() != 2 {
             return Err(anyhow!(
                 "SONGLINK_USER_COUNTRY must be a two-letter country code"
@@ -173,5 +170,15 @@ mod tests {
             error.to_string(),
             "EVERNOTE_TAGS must contain at least one non-empty value"
         );
+    }
+
+    #[test]
+    fn allows_zero_max_tracks_per_run_as_unlimited() {
+        let mut settings = base_settings();
+        settings.max_tracks_per_run = 0;
+
+        let settings = settings.validate().expect("valid settings");
+
+        assert_eq!(settings.max_tracks_per_run, 0);
     }
 }

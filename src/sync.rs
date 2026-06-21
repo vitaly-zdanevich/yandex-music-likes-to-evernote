@@ -35,7 +35,7 @@ pub fn run(settings: Settings) -> Result<()> {
         .filter(|track| !state.contains(&track.id))
         .collect::<Vec<_>>();
 
-    if new_tracks.len() > settings.max_tracks_per_run {
+    if settings.max_tracks_per_run != 0 && new_tracks.len() > settings.max_tracks_per_run {
         warn!(
             total_new_tracks = new_tracks.len(),
             limit = settings.max_tracks_per_run,
