@@ -36,11 +36,21 @@ Optional GitHub Actions repository variables:
 - `STATE_PATH`: state JSON file path. Defaults to `state.json`.
 - `DRY_RUN`: set to `true` to print notes without creating them.
 - `MAX_TRACKS_PER_RUN`: cap created notes per run. Set to `0` to disable the cap. Defaults to `30`.
-- `BACKUP_AUDIO`: download each track's audio in the highest available quality (no re-encoding) and attach it to its note. Defaults to `true`. Lossless FLAC requires a Yandex Plus subscription tier that grants it; otherwise the best available lossy stream is used. Attachments count against your Evernote note-size and monthly upload limits (a lossless track is typically 20–40 MB), so set this to `false` if you want metadata-only notes. If a download fails transiently, the track is left unprocessed and retried on the next run rather than saved without audio.
+- `BACKUP_AUDIO`: download each track's audio in the highest available quality (no re-encoding) and attach it to its note. Defaults to `true`. Lossless FLAC requires a Yandex Plus subscription tier that grants it; otherwise the best available lossy stream is used. Attachments count against your Evernote note-size and monthly upload limits, so set this to `false` if you want metadata-only notes. If a download fails transiently, the track is left unprocessed and retried on the next run rather than saved without audio. See [Audio backup](#audio-backup) for the resulting file formats.
 - `ENRICH_EXTERNAL_LINKS`: add external MusicBrainz, LRCLIB, Songlink/Odesli, Wikidata, Wikipedia, YouTube, and Genius links. Defaults to `true`.
 - `SONGLINK_USER_COUNTRY`: optional two-letter country code for Songlink/Odesli lookup. Defaults to `US`.
 
 External enrichment sends artist/title/album/link metadata to the selected public services. It never copies lyrics into Evernote.
+
+## Audio backup
+
+With `BACKUP_AUDIO` enabled (the default), each note carries the track's audio downloaded in the highest quality the account is entitled to and stored byte-for-byte — no re-encoding. The file format therefore mirrors whatever Yandex Music serves:
+
+- **Lossless** → FLAC inside an MP4 container, saved as `.mp4` (`audio/mp4`). Yandex Music does not expose a native `.flac` stream, so a lossless track is a `.mp4` file whose audio is bit-exact FLAC. Needs a Yandex Plus tier that grants lossless.
+- **High lossy** → AAC in MP4, saved as `.m4a` (`audio/mp4`).
+- **Standard** → MP3, saved as `.mp3` (`audio/mpeg`).
+
+Availability is per track: even with Yandex Plus some tracks only offer AAC or MP3, and the highest available is used. A lossless track is typically 30–70 MB, so on a large backfill keep an eye on your Evernote monthly upload quota (the per-run cap throttles this). You can preview what your account is served with the [audio smoke test](#audio-smoke-test).
 
 ## First Run
 
