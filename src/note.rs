@@ -118,4 +118,26 @@ mod tests {
         assert!(enml.contains("MusicBrainz recording search"));
         assert!(enml.contains("musicbrainz.org"));
     }
+
+    #[test]
+    fn renders_minimal_note_without_optional_sections() {
+        let track = LikedTrack {
+            id: "2".to_string(),
+            liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            title: "Solo Track".to_string(),
+            artists: Vec::new(),
+            albums: Vec::new(),
+            duration_ms: None,
+            cover_url: None,
+            yandex_url: "https://music.yandex.com/track/2".to_string(),
+        };
+
+        let enml = enml(&track, &[]);
+
+        assert_eq!(title(&track), "Solo Track");
+        assert!(enml.contains("<div><b>Track:</b> Solo Track</div>"));
+        assert!(!enml.contains("<b>Duration:</b>"));
+        assert!(!enml.contains("<b>Cover:</b>"));
+        assert!(!enml.contains("<b>External links:</b>"));
+    }
 }

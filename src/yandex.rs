@@ -294,4 +294,46 @@ mod tests {
         assert_eq!(track.albums, vec!["Album"]);
         assert_eq!(track.duration_ms, Some(123000));
     }
+
+    #[test]
+    fn decodes_string_ids_and_duration_values() {
+        let track = serde_json::from_str::<RawTrack>(
+            r#"{
+                "id": "track-id",
+                "title": null,
+                "artists": [{"name": "  "}, {"name": "Artist"}],
+                "albums": [{"title": ""}, {"title": "Album"}],
+                "ogImage": "https://example.test/cover.jpg",
+                "durationMs": "45000"
+            }"#,
+        )
+        .expect("track should decode");
+
+        let liked_at = DateTime::parse_from_rfc3339("2026-06-20T00:00:00Z")
+            .expect("valid date")
+            .with_timezone(&Utc);
+        let track = to_liked_track(track, liked_at);
+
+        assert_eq!(track.id, "track-id");
+        assert_eq!(track.title, "Track track-id");
+        assert_eq!(track.artists, vec!["Artist"]);
+        assert_eq!(track.albums, vec!["Album"]);
+        assert_eq!(
+            track.cover_url.as_deref(),
+            Some("https://example.test/cover.jpg")
+        );
+        assert_eq!(track.duration_ms, Some(45_000));
+    }
+
+    #[test]
+    fn rejects_invalid_track_id_type() {
+        let error = serde_json::from_str::<RawTrack>(
+            r#"{
+                "id": {"unexpected": true}
+            }"#,
+        )
+        .expect_err("invalid id should fail");
+
+        assert!(error.to_string().contains("expected string or number"));
+    }
 }

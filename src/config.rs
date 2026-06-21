@@ -181,4 +181,57 @@ mod tests {
 
         assert_eq!(settings.max_tracks_per_run, 0);
     }
+
+    #[test]
+    fn rejects_required_blank_tokens() {
+        let mut settings = base_settings();
+        settings.yandex_music_token = "  ".to_string();
+
+        let error = settings.validate().expect_err("invalid settings");
+
+        assert_eq!(error.to_string(), "YANDEX_MUSIC_TOKEN must not be empty");
+    }
+
+    #[test]
+    fn trims_optional_values_and_normalizes_country() {
+        let mut settings = base_settings();
+        settings.evernote_note_store_url = Some(" https://example.test/notestore ".to_string());
+        settings.evernote_user_store_url = " https://example.test/user ".to_string();
+        settings.evernote_notebook_guid = Some(" Music Inbox ".to_string());
+        settings.genius_access_token = Some(" genius-token ".to_string());
+        settings.songlink_user_country = "ge".to_string();
+
+        let settings = settings.validate().expect("valid settings");
+
+        assert_eq!(
+            settings.evernote_note_store_url.as_deref(),
+            Some("https://example.test/notestore")
+        );
+        assert_eq!(
+            settings.evernote_user_store_url,
+            "https://example.test/user"
+        );
+        assert_eq!(
+            settings.evernote_notebook_guid.as_deref(),
+            Some("Music Inbox")
+        );
+        assert_eq!(
+            settings.genius_access_token.as_deref(),
+            Some("genius-token")
+        );
+        assert_eq!(settings.songlink_user_country, "GE");
+    }
+
+    #[test]
+    fn rejects_invalid_songlink_country() {
+        let mut settings = base_settings();
+        settings.songlink_user_country = "usa".to_string();
+
+        let error = settings.validate().expect_err("invalid settings");
+
+        assert_eq!(
+            error.to_string(),
+            "SONGLINK_USER_COUNTRY must be a two-letter country code"
+        );
+    }
 }

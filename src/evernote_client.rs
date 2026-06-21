@@ -500,6 +500,20 @@ mod tests {
         })
     }
 
+    fn create_note_response_without_guid() -> Vec<u8> {
+        let result = note_store::NoteStoreCreateNoteResult {
+            result_value: Some(types::Note::default()),
+            user_exception: None,
+            system_exception: None,
+            not_found_exception: None,
+        };
+        thrift_response("createNote", |protocol| {
+            result
+                .write_to_out_protocol(protocol)
+                .expect("write create note result")
+        })
+    }
+
     fn user_urls_response(note_store_url: &str) -> Vec<u8> {
         let urls = user_store::UserUrls {
             note_store_url: Some(note_store_url.to_string()),
@@ -682,6 +696,90 @@ mod tests {
         assert_eq!(
             requests[1].note.notebook_guid.as_deref(),
             Some(NOTEBOOK_GUID)
+        );
+    }
+
+    #[test]
+    fn create_track_note_reports_missing_created_note_guid() {
+        let http = MockHttpClient::default();
+        http.push_response(create_note_response_without_guid());
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http,
+        );
+
+        let error = client
+            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect_err("missing note GUID should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Evernote did not return a GUID for the created note"
+        );
+    }
+
+    #[test]
+    fn create_track_note_reports_missing_notebook_name() {
+        let http = MockHttpClient::default();
+        http.push_response(list_notebooks_response(vec![types::Notebook {
+            guid: Some(NOTEBOOK_GUID.to_string()),
+            name: Some("Other".to_string()),
+            ..types::Notebook::default()
+        }]));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some("Music Inbox".to_string()),
+            tag_names(),
+            http,
+        );
+
+        let error = client
+            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect_err("missing notebook should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Evernote notebook named 'Music Inbox' was not found"
+        );
+    }
+
+    #[test]
+    fn create_track_note_reports_duplicate_notebook_names() {
+        let http = MockHttpClient::default();
+        http.push_response(list_notebooks_response(vec![
+            types::Notebook {
+                guid: Some("00000000-0000-0000-0000-000000000111".to_string()),
+                name: Some("Music Inbox".to_string()),
+                ..types::Notebook::default()
+            },
+            types::Notebook {
+                guid: Some("00000000-0000-0000-0000-000000000222".to_string()),
+                name: Some("Music Inbox".to_string()),
+                ..types::Notebook::default()
+            },
+        ]));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some("Music Inbox".to_string()),
+            tag_names(),
+            http,
+        );
+
+        let error = client
+            .create_track_note("Title".to_string(), "<en-note>Body</en-note>".to_string())
+            .expect_err("duplicate notebook should fail");
+
+        assert_eq!(
+            error.to_string(),
+            "Evernote returned more than one notebook named 'Music Inbox'"
         );
     }
 

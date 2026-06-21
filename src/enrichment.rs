@@ -516,4 +516,42 @@ mod tests {
 
         assert_eq!(recording.score, 100);
     }
+
+    #[test]
+    fn builds_fallback_links_without_artist_or_album() {
+        let mut track = sample_track();
+        track.artists.clear();
+        track.albums.clear();
+        track.duration_ms = None;
+
+        assert_eq!(musicbrainz_query(&track), "recording:\"Song & Name\"");
+        assert_eq!(human_query(&track), "Song & Name");
+        assert_eq!(
+            lrclib_get_url(&track),
+            "https://lrclib.net/api/get?track_name=Song+%26+Name&artist_name=&album_name="
+        );
+        assert!(wikimedia_links(&track).is_empty());
+    }
+
+    #[test]
+    fn escapes_musicbrainz_lucene_query_parts() {
+        let mut track = sample_track();
+        track.title = "Quote \" and slash \\".to_string();
+        track.artists = vec!["Artist \"Name\"".to_string()];
+
+        assert_eq!(
+            musicbrainz_query(&track),
+            "recording:\"Quote \\\" and slash \\\\\" AND artist:\"Artist \\\"Name\\\"\""
+        );
+    }
+
+    #[test]
+    fn decodes_non_numeric_musicbrainz_score_as_zero() {
+        let recording =
+            serde_json::from_str::<MusicBrainzRecording>(r#"{"id":"id","score":"not-a-number"}"#)
+                .expect("deserialize recording");
+
+        assert_eq!(recording.score, 0);
+        assert_eq!(recording.length, None);
+    }
 }
