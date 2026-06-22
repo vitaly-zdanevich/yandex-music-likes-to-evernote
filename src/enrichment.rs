@@ -1,7 +1,18 @@
-use std::time::Duration;
+use std::{
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+    },
+    time::Duration,
+};
 
 use anyhow::{Context, Result};
+use reqwest::{
+    StatusCode,
+    header::{HeaderValue, RETRY_AFTER},
+};
 use serde::{Deserialize, Deserializer};
+use tokio::time::sleep;
 use tracing::warn;
 use url::form_urlencoded;
 
@@ -11,6 +22,9 @@ const CLIENT_NAME: &str = "yandex-music-likes-to-evernote/0.1";
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSICBRAINZ_MIN_SCORE: i64 = 90;
 const MUSICBRAINZ_DURATION_TOLERANCE_MS: u128 = 7_000;
+const SONGLINK_MAX_ATTEMPTS: usize = 3;
+const SONGLINK_BACKOFFS: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
+const SONGLINK_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLink {
@@ -32,6 +46,9 @@ pub struct EnrichmentClient {
     http: reqwest::Client,
     genius_access_token: Option<String>,
     songlink_user_country: String,
+    // Once Songlink keeps returning 429 after retries, avoid slowing every later
+    // track in the same sync run with more calls that are likely to fail.
+    songlink_rate_limited: Arc<AtomicBool>,
 }
 
 impl EnrichmentClient {
@@ -48,6 +65,7 @@ impl EnrichmentClient {
             http,
             genius_access_token,
             songlink_user_country: songlink_user_country.into(),
+            songlink_rate_limited: Arc::new(AtomicBool::new(false)),
         })
     }
 
@@ -135,18 +153,12 @@ impl EnrichmentClient {
     }
 
     async fn songlink_link(&self, track: &LikedTrack) -> Option<ExternalLink> {
-        let url = songlink_api_url(track, &self.songlink_user_country);
-        let response = match self.http.get(&url).send().await {
-            Ok(response) => response,
-            Err(error) => {
-                warn!(error = %error, "Songlink/Odesli lookup failed");
-                return None;
-            }
-        };
-        if !response.status().is_success() {
-            warn!(status = %response.status(), "Songlink/Odesli lookup returned non-success status");
+        if self.songlink_rate_limited.load(Ordering::Relaxed) {
             return None;
         }
+
+        let url = songlink_api_url(track, &self.songlink_user_country);
+        let response = self.songlink_response_with_retries(&url).await?;
 
         let response = match response.json::<SonglinkResponse>().await {
             Ok(response) => response,
@@ -160,6 +172,55 @@ impl EnrichmentClient {
             .page_url
             .filter(|url| !url.trim().is_empty())
             .map(|url| ExternalLink::new("Songlink/Odesli", url))
+    }
+
+    /// Calls Songlink and waits through short 429 bursts before giving up.
+    ///
+    /// A successful response is returned to the caller for JSON parsing. Other
+    /// failures are non-fatal for sync: the note will still use the fallback
+    /// Songlink lookup URL.
+    async fn songlink_response_with_retries(&self, url: &str) -> Option<reqwest::Response> {
+        for attempt in 1..=SONGLINK_MAX_ATTEMPTS {
+            let response = match self.http.get(url).send().await {
+                Ok(response) => response,
+                Err(error) => {
+                    warn!(error = %error, attempt, "Songlink/Odesli lookup failed");
+                    return None;
+                }
+            };
+
+            if response.status().is_success() {
+                return Some(response);
+            }
+
+            let status = response.status();
+            if status != StatusCode::TOO_MANY_REQUESTS {
+                warn!(status = %status, "Songlink/Odesli lookup returned non-success status");
+                return None;
+            }
+
+            if attempt == SONGLINK_MAX_ATTEMPTS {
+                self.songlink_rate_limited.store(true, Ordering::Relaxed);
+                warn!(
+                    status = %status,
+                    attempts = attempt,
+                    "Songlink/Odesli lookup stayed rate-limited after retries; skipping Songlink for the rest of this run"
+                );
+                return None;
+            }
+
+            let delay = songlink_retry_delay(response.headers().get(RETRY_AFTER), attempt - 1);
+            warn!(
+                status = %status,
+                attempt,
+                max_attempts = SONGLINK_MAX_ATTEMPTS,
+                retry_after_seconds = delay.as_secs(),
+                "Songlink/Odesli lookup rate-limited; backing off"
+            );
+            sleep(delay).await;
+        }
+
+        None
     }
 
     async fn genius_link(&self, track: &LikedTrack) -> Option<ExternalLink> {
@@ -193,6 +254,28 @@ impl EnrichmentClient {
             .find(|url| !url.trim().is_empty())
             .map(|url| ExternalLink::new("Genius", url))
     }
+}
+
+/// Picks the next Songlink retry delay, preferring a valid Retry-After header.
+fn songlink_retry_delay(retry_after: Option<&HeaderValue>, backoff_index: usize) -> Duration {
+    retry_after
+        .and_then(parse_retry_after_seconds)
+        .unwrap_or_else(|| songlink_backoff(backoff_index))
+}
+
+/// Parses the numeric Retry-After form used by rate-limit responses.
+fn parse_retry_after_seconds(header: &HeaderValue) -> Option<Duration> {
+    let seconds = header.to_str().ok()?.trim().parse::<u64>().ok()?;
+    Some(Duration::from_secs(seconds).min(SONGLINK_MAX_RETRY_AFTER))
+}
+
+/// Returns the configured Songlink backoff for an attempt, reusing the last
+/// value if more attempts are added without extending the backoff table.
+fn songlink_backoff(index: usize) -> Duration {
+    SONGLINK_BACKOFFS
+        .get(index)
+        .copied()
+        .unwrap_or(*SONGLINK_BACKOFFS.last().expect("songlink backoff exists"))
 }
 
 fn musicbrainz_recording_matches(recording: &MusicBrainzRecording, track: &LikedTrack) -> bool {
@@ -565,6 +648,37 @@ mod tests {
             "Wikidata track search",
             "https://www.wikidata.org/w/index.php?search=Artist+Name+Song+%26+Name"
         )));
+    }
+
+    #[test]
+    fn uses_songlink_retry_after_seconds() {
+        let retry_after = HeaderValue::from_static("42");
+
+        assert_eq!(
+            songlink_retry_delay(Some(&retry_after), 0),
+            Duration::from_secs(42)
+        );
+    }
+
+    #[test]
+    fn caps_songlink_retry_after_seconds() {
+        let retry_after = HeaderValue::from_static("3600");
+
+        assert_eq!(
+            songlink_retry_delay(Some(&retry_after), 0),
+            SONGLINK_MAX_RETRY_AFTER
+        );
+    }
+
+    #[test]
+    fn falls_back_to_songlink_backoff_without_valid_retry_after() {
+        let retry_after = HeaderValue::from_static("not-a-number");
+
+        assert_eq!(
+            songlink_retry_delay(Some(&retry_after), 1),
+            Duration::from_secs(30)
+        );
+        assert_eq!(songlink_retry_delay(None, 99), Duration::from_secs(30));
     }
 
     #[test]
