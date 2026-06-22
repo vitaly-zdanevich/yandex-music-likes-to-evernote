@@ -47,6 +47,7 @@ pub fn run(settings: Settings) -> Result<()> {
 
     info!(new_tracks = new_tracks.len(), "found new liked tracks");
 
+    let mut saved_count = 0usize;
     for track in new_tracks {
         let title = note::title(&track);
         let external_links = if let Some(enrichment) = &enrichment {
@@ -94,6 +95,8 @@ pub fn run(settings: Settings) -> Result<()> {
             audio_attached = audio.is_some(),
             "created Evernote note"
         );
+        saved_count += 1;
+        info!("{saved_count} saved");
 
         state.mark_processed(track.id);
         state.save(&settings.state_path)?;
