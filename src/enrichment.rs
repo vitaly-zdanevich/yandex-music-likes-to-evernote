@@ -18,7 +18,7 @@ use url::form_urlencoded;
 
 use crate::yandex::LikedTrack;
 
-const CLIENT_NAME: &str = "yandex-music-likes-to-evernote/0.1";
+const CLIENT_NAME: &str = concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSICBRAINZ_MIN_SCORE: i64 = 90;
 const MUSICBRAINZ_DURATION_TOLERANCE_MS: u128 = 7_000;

@@ -12,7 +12,7 @@ use reqwest::blocking::Client as ReqwestClient;
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{ReadHalf, TIoChannel, WriteHalf};
 
-const CLIENT_NAME: &str = "yandex-music-likes-to-evernote/0.1";
+const CLIENT_NAME: &str = concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
 
 type InputProtocol<C> = TBinaryInputProtocol<ReadHalf<ThriftHttpChannel<C>>>;

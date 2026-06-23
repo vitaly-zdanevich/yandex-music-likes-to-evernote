@@ -14,7 +14,8 @@ use yandex_music::{
 
 use crate::audio::TrackAudio;
 
-const AUDIO_DOWNLOAD_USER_AGENT: &str = "yandex-music-likes-to-evernote/0.1";
+const AUDIO_DOWNLOAD_USER_AGENT: &str =
+    concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
 const AUDIO_DOWNLOAD_TIMEOUT: Duration = Duration::from_secs(120);
 
 /// Audio qualities to try, best first. Lossless requires a Yandex Plus tier that
