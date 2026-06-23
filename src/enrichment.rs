@@ -82,6 +82,7 @@ enum ExternalLinkService {
     Wikidata,
     Wikipedia,
     Yandex,
+    YandexVideo,
     YouTube,
     YouTubeMusic,
 }
@@ -124,6 +125,7 @@ impl ExternalLinkService {
             "wikidata" => Some(Self::Wikidata),
             "wikipedia" => Some(Self::Wikipedia),
             "yandex" => Some(Self::Yandex),
+            "yandexvideo" => Some(Self::YandexVideo),
             "youtube" => Some(Self::YouTube),
             "youtubemusic" | "ytmusic" => Some(Self::YouTubeMusic),
             _ => None,
@@ -162,6 +164,7 @@ const EXTERNAL_LINK_SERVICE_NAMES: &[&str] = &[
     "wikidata",
     "wikipedia",
     "yandex",
+    "yandexvideo",
     "youtube",
     "youtubemusic",
 ];
@@ -216,6 +219,17 @@ impl EnrichmentClient {
     ) -> Vec<ExternalLink> {
         let mut links = Vec::new();
 
+        links.extend(youtube_links(
+            track,
+            &self.enabled_services,
+            &self.disabled_services,
+        ));
+        if self.service_enabled(ExternalLinkService::LastFm) {
+            links.extend(lastfm_links(track));
+        }
+        if self.service_enabled(ExternalLinkService::RuTracker) {
+            links.extend(rutracker_links(track));
+        }
         links.extend(self.musicbrainz_links(track, audio).await);
 
         if self.service_enabled(ExternalLinkService::Lrclib) {
@@ -240,13 +254,6 @@ impl EnrichmentClient {
             &self.enabled_services,
             &self.disabled_services,
         ));
-
-        if self.service_enabled(ExternalLinkService::YouTube) {
-            links.push(ExternalLink::new(
-                "YouTube search",
-                youtube_search_url(track),
-            ));
-        }
 
         if self.service_enabled(ExternalLinkService::Genius) {
             links.push(
@@ -845,6 +852,12 @@ fn wikimedia_links(
             wikidata_search_url(&track_query),
         ));
     }
+    if wikipedia_enabled && !track_query.trim().is_empty() {
+        links.push(ExternalLink::new(
+            "Wikipedia track search",
+            wikipedia_search_url(&track_query),
+        ));
+    }
 
     if let Some(artist) = track
         .artists
@@ -887,6 +900,41 @@ fn wikimedia_links(
                 wikipedia_search_url(&query),
             ));
         }
+    }
+
+    links
+}
+
+fn youtube_links(
+    track: &LikedTrack,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Vec<ExternalLink> {
+    let query = human_query(track);
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut links = Vec::new();
+    if external_link_service_enabled(
+        ExternalLinkService::YouTubeMusic,
+        enabled_services,
+        disabled_services,
+    ) {
+        links.push(ExternalLink::new(
+            "YouTube Music search",
+            youtube_music_search_url(&query),
+        ));
+    }
+    if external_link_service_enabled(
+        ExternalLinkService::YouTube,
+        enabled_services,
+        disabled_services,
+    ) {
+        links.push(ExternalLink::new(
+            "YouTube search",
+            youtube_search_url(track),
+        ));
     }
 
     links
@@ -947,10 +995,6 @@ fn related_music_service_links(
         ExternalLink::new("Amazon Music search", amazon_music_search_url(&query)),
     );
     push_link(
-        ExternalLinkService::YouTubeMusic,
-        ExternalLink::new("YouTube Music search", youtube_music_search_url(&query)),
-    );
-    push_link(
         ExternalLinkService::Beatport,
         ExternalLink::new("Beatport search", beatport_search_url(&query)),
     );
@@ -1000,13 +1044,6 @@ fn related_music_service_links(
     );
 
     if external_link_service_enabled(
-        ExternalLinkService::LastFm,
-        enabled_services,
-        disabled_services,
-    ) {
-        links.extend(lastfm_links(track));
-    }
-    if external_link_service_enabled(
         ExternalLinkService::TheAudioDb,
         enabled_services,
         disabled_services,
@@ -1014,11 +1051,11 @@ fn related_music_service_links(
         links.extend(theaudiodb_search_links(track));
     }
     if external_link_service_enabled(
-        ExternalLinkService::RuTracker,
+        ExternalLinkService::YandexVideo,
         enabled_services,
         disabled_services,
     ) {
-        links.extend(rutracker_links(track));
+        links.extend(yandex_video_links(track));
     }
     links
 }
@@ -1131,6 +1168,45 @@ fn rutracker_links(track: &LikedTrack) -> Vec<ExternalLink> {
         links.push(ExternalLink::new(
             "RuTracker track search",
             rutracker_search_url(&track.title),
+        ));
+    }
+
+    links
+}
+
+/// Builds typed Yandex Video searches for track, album, and artist.
+fn yandex_video_links(track: &LikedTrack) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+
+    if let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    {
+        links.push(ExternalLink::new(
+            "Yandex Video track search",
+            yandex_video_search_url(&format!("{artist} {}", track.title)),
+        ));
+
+        if let Some(album) = track
+            .albums
+            .first()
+            .filter(|album| !album.trim().is_empty())
+        {
+            links.push(ExternalLink::new(
+                "Yandex Video album search",
+                yandex_video_search_url(&format!("{artist} {album}")),
+            ));
+        }
+
+        links.push(ExternalLink::new(
+            "Yandex Video artist search",
+            yandex_video_search_url(artist),
+        ));
+    } else {
+        links.push(ExternalLink::new(
+            "Yandex Video track search",
+            yandex_video_search_url(&track.title),
         ));
     }
 
@@ -1347,6 +1423,10 @@ fn bing_search_url(query: &str) -> String {
 
 fn yandex_search_url(query: &str) -> String {
     query_url("https://yandex.ru/search/", &[("text", query)])
+}
+
+fn yandex_video_search_url(query: &str) -> String {
+    query_url("https://yandex.ru/video/search", &[("text", query)])
 }
 
 fn theaudiodb_artist_search_url(artist: &str) -> String {
@@ -1635,6 +1715,19 @@ mod tests {
         let disabled_services = no_disabled_services();
 
         assert_eq!(
+            youtube_links(&track, &enabled_services, &disabled_services),
+            vec![
+                ExternalLink::new(
+                    "YouTube Music search",
+                    "https://music.youtube.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "YouTube search",
+                    "https://www.youtube.com/results?search_query=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+            ]
+        );
+        assert_eq!(
             related_music_service_links(&track, &enabled_services, &disabled_services),
             vec![
                 ExternalLink::new(
@@ -1672,10 +1765,6 @@ mod tests {
                 ExternalLink::new(
                     "Amazon Music search",
                     "https://music.amazon.com/search/Artist%20Name%20Song%20%26%20Name%20Album%20Name"
-                ),
-                ExternalLink::new(
-                    "YouTube Music search",
-                    "https://music.youtube.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
                 ),
                 ExternalLink::new(
                     "Beatport search",
@@ -1726,18 +1815,6 @@ mod tests {
                     "https://yandex.ru/search/?text=Artist+Name+Song+%26+Name+Album+Name"
                 ),
                 ExternalLink::new(
-                    "Last.fm artist search",
-                    "https://www.last.fm/search/artists?q=Artist+Name"
-                ),
-                ExternalLink::new(
-                    "Last.fm track search",
-                    "https://www.last.fm/search/tracks?q=Artist+Name+Song+%26+Name"
-                ),
-                ExternalLink::new(
-                    "Last.fm album search",
-                    "https://www.last.fm/search/albums?q=Artist+Name+Album+Name"
-                ),
-                ExternalLink::new(
                     "TheAudioDB artist search",
                     "https://www.theaudiodb.com/api/v1/json/2/search.php?s=Artist+Name"
                 ),
@@ -1748,6 +1825,62 @@ mod tests {
                 ExternalLink::new(
                     "TheAudioDB album search",
                     "https://www.theaudiodb.com/api/v1/json/2/searchalbum.php?s=Artist+Name&a=Album+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video track search",
+                    "https://yandex.ru/video/search?text=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video album search",
+                    "https://yandex.ru/video/search?text=Artist+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video artist search",
+                    "https://yandex.ru/video/search?text=Artist+Name"
+                ),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn orders_youtube_lastfm_and_rutracker_first() {
+        let track = sample_track();
+        let client = EnrichmentClient::new(
+            None,
+            "US",
+            None,
+            vec![
+                "youtube-music".to_string(),
+                "youtube".to_string(),
+                "lastfm".to_string(),
+                "rutracker".to_string(),
+            ],
+            Vec::<String>::new(),
+        )
+        .expect("client");
+
+        assert_eq!(
+            client.links_for(&track, None).await,
+            vec![
+                ExternalLink::new(
+                    "YouTube Music search",
+                    "https://music.youtube.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "YouTube search",
+                    "https://www.youtube.com/results?search_query=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm artist search",
+                    "https://www.last.fm/search/artists?q=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm track search",
+                    "https://www.last.fm/search/tracks?q=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm album search",
+                    "https://www.last.fm/search/albums?q=Artist+Name+Album+Name"
                 ),
                 ExternalLink::new(
                     "RuTracker artist search",
@@ -1942,6 +2075,7 @@ mod tests {
             "ddg".to_string(),
             "odesli".to_string(),
             "rutracker".to_string(),
+            "yandex-video".to_string(),
         ])
         .expect("parse services");
 
@@ -1950,6 +2084,7 @@ mod tests {
         assert!(services.contains(&ExternalLinkService::DuckDuckGo));
         assert!(services.contains(&ExternalLinkService::Songlink));
         assert!(services.contains(&ExternalLinkService::RuTracker));
+        assert!(services.contains(&ExternalLinkService::YandexVideo));
     }
 
     #[test]
@@ -1977,6 +2112,20 @@ mod tests {
                 "https://open.spotify.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
             )]
         );
+
+        let enabled_services =
+            parse_external_link_services(vec!["youtube".to_string(), "youtube-music".to_string()])
+                .expect("enabled YouTube services");
+        let disabled_services =
+            parse_external_link_services(vec!["youtube".to_string()]).expect("disabled YouTube");
+
+        assert_eq!(
+            youtube_links(&track, &enabled_services, &disabled_services),
+            vec![ExternalLink::new(
+                "YouTube Music search",
+                "https://music.youtube.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+            )]
+        );
     }
 
     #[test]
@@ -1996,10 +2145,16 @@ mod tests {
         );
         assert_eq!(
             wikimedia_links(&track, &enabled_services, &disabled_services),
-            vec![ExternalLink::new(
-                "Wikidata track search",
-                "https://www.wikidata.org/w/index.php?search=Song+%26+Name"
-            )]
+            vec![
+                ExternalLink::new(
+                    "Wikidata track search",
+                    "https://www.wikidata.org/w/index.php?search=Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Wikipedia track search",
+                    "https://en.wikipedia.org/w/index.php?search=Song+%26+Name"
+                ),
+            ]
         );
         assert_eq!(musicbrainz_entity_search_links(&track), Vec::new());
         assert_eq!(
@@ -2011,11 +2166,15 @@ mod tests {
                 "https://open.spotify.com/search?q=Song+%26+Name"
             )
         );
+        assert!(lastfm_links(&track).contains(&ExternalLink::new(
+            "Last.fm track search",
+            "https://www.last.fm/search/tracks?q=Song+%26+Name"
+        )));
         assert!(
             related_music_service_links(&track, &enabled_services, &disabled_services).contains(
                 &ExternalLink::new(
-                    "Last.fm track search",
-                    "https://www.last.fm/search/tracks?q=Song+%26+Name"
+                    "Yandex Video track search",
+                    "https://yandex.ru/video/search?text=Song+%26+Name"
                 )
             )
         );
@@ -2027,13 +2186,34 @@ mod tests {
         let enabled_services = no_enabled_services();
         let disabled_services = no_disabled_services();
 
-        assert!(
-            wikimedia_links(&track, &enabled_services, &disabled_services).contains(
-                &ExternalLink::new(
+        assert_eq!(
+            wikimedia_links(&track, &enabled_services, &disabled_services),
+            vec![
+                ExternalLink::new(
                     "Wikidata track search",
                     "https://www.wikidata.org/w/index.php?search=Artist+Name+Song+%26+Name"
-                )
-            )
+                ),
+                ExternalLink::new(
+                    "Wikipedia track search",
+                    "https://en.wikipedia.org/w/index.php?search=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Wikidata artist search",
+                    "https://www.wikidata.org/w/index.php?search=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "Wikipedia artist search",
+                    "https://en.wikipedia.org/w/index.php?search=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "Wikidata album search",
+                    "https://www.wikidata.org/w/index.php?search=Artist+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Wikipedia album search",
+                    "https://en.wikipedia.org/w/index.php?search=Artist+Name+Album+Name"
+                ),
+            ]
         );
     }
 
