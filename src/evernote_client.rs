@@ -1,9 +1,12 @@
 use std::io::{self, Read, Write};
 use std::sync::{Arc, Mutex};
+use std::thread::sleep;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use evernote::note_store::{NoteStoreSyncClient, TNoteStoreSyncClient};
+use evernote::note_store::{
+    NoteFilter, NoteStoreSyncClient, NotesMetadataResultSpec, TNoteStoreSyncClient,
+};
 use evernote::types::{self, Data, NoteAttributes, Resource, ResourceAttributes};
 use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
 
@@ -11,9 +14,16 @@ use crate::audio::{AudioAttachment, CoverAttachment};
 use reqwest::blocking::Client as ReqwestClient;
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{ReadHalf, TIoChannel, WriteHalf};
+use tracing::warn;
 
 const CLIENT_NAME: &str = concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(20);
+const CREATE_NOTE_MAX_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const CREATE_NOTE_RETRY_BACKOFFS: [Duration; 2] =
+    [Duration::from_secs(10), Duration::from_secs(30)];
+#[cfg(test)]
+const CREATE_NOTE_RETRY_BACKOFFS: [Duration; 2] = [Duration::ZERO, Duration::ZERO];
 
 type InputProtocol<C> = TBinaryInputProtocol<ReadHalf<ThriftHttpChannel<C>>>;
 type OutputProtocol<C> = TBinaryOutputProtocol<WriteHalf<ThriftHttpChannel<C>>>;
@@ -125,14 +135,13 @@ where
         audio: Option<&AudioAttachment>,
     ) -> Result<String> {
         let notebook_guid = self.notebook_guid()?;
-        let mut client = self.note_store_client()?;
         let note = types::Note {
             title: Some(title),
             content: Some(content),
-            notebook_guid,
+            notebook_guid: notebook_guid.clone(),
             attributes: Some(NoteAttributes {
                 source: Some("yandex-music-likes-to-evernote".to_string()),
-                source_u_r_l: Some(source_url),
+                source_u_r_l: Some(source_url.clone()),
                 source_application: Some(CLIENT_NAME.to_string()),
                 ..NoteAttributes::default()
             }),
@@ -141,13 +150,106 @@ where
             ..types::Note::default()
         };
 
-        let created = client
-            .create_note(self.token.clone(), note)
+        self.create_note_with_retries(note, notebook_guid.as_deref(), &source_url)
+    }
+
+    fn create_note_with_retries(
+        &self,
+        note: types::Note,
+        notebook_guid: Option<&str>,
+        source_url: &str,
+    ) -> Result<String> {
+        for attempt in 1..=CREATE_NOTE_MAX_ATTEMPTS {
+            let mut client = self.note_store_client()?;
+            match client.create_note(self.token.clone(), note.clone()) {
+                Ok(created) => {
+                    return created
+                        .guid
+                        .context("Evernote did not return a GUID for the created note");
+                }
+                Err(error)
+                    if should_retry_evernote_error(&error)
+                        && attempt < CREATE_NOTE_MAX_ATTEMPTS =>
+                {
+                    let delay = create_note_retry_delay(attempt - 1);
+                    warn!(
+                        attempt,
+                        max_attempts = CREATE_NOTE_MAX_ATTEMPTS,
+                        retry_after_seconds = delay.as_secs(),
+                        error = %error,
+                        "Evernote createNote failed; backing off before retry"
+                    );
+                    sleep(delay);
+                    if let Some(guid) =
+                        self.created_note_guid_by_source_url(notebook_guid, source_url)
+                    {
+                        warn!(
+                            attempt,
+                            evernote_guid = guid,
+                            source_url,
+                            "Evernote note exists after createNote transport failure; using existing note"
+                        );
+                        return Ok(guid);
+                    }
+                }
+                Err(error) => return Err(anyhow::anyhow!("Evernote API error: {error}")),
+            }
+        }
+
+        Err(anyhow::anyhow!(
+            "Evernote API error: createNote retry loop ended without a result"
+        ))
+    }
+
+    fn created_note_guid_by_source_url(
+        &self,
+        notebook_guid: Option<&str>,
+        source_url: &str,
+    ) -> Option<String> {
+        match self.find_note_guid_by_source_url(notebook_guid, source_url) {
+            Ok(guid) => guid,
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    source_url,
+                    "failed to check Evernote for an existing note after createNote failure"
+                );
+                None
+            }
+        }
+    }
+
+    fn find_note_guid_by_source_url(
+        &self,
+        notebook_guid: Option<&str>,
+        source_url: &str,
+    ) -> Result<Option<String>> {
+        let mut client = self.note_store_client()?;
+        let filter = NoteFilter {
+            words: Some(source_url_search_query(source_url)),
+            notebook_guid: notebook_guid.map(ToOwned::to_owned),
+            inactive: Some(false),
+            ..NoteFilter::default()
+        };
+        let result_spec = NotesMetadataResultSpec {
+            include_attributes: Some(true),
+            include_notebook_guid: Some(true),
+            ..NotesMetadataResultSpec::default()
+        };
+        let notes = client
+            .find_notes_metadata(self.token.clone(), filter, 0, 5, result_spec)
             .map_err(|error| anyhow::anyhow!("Evernote API error: {error}"))?;
 
-        created
-            .guid
-            .context("Evernote did not return a GUID for the created note")
+        Ok(notes
+            .notes
+            .into_iter()
+            .find(|note| {
+                note.attributes
+                    .as_ref()
+                    .and_then(|attributes| attributes.source_u_r_l.as_deref())
+                    == Some(source_url)
+            })
+            .map(|note| note.guid))
     }
 
     fn note_store_client(
@@ -257,6 +359,33 @@ where
             .guid
             .with_context(|| format!("Evernote notebook named '{name}' did not include a GUID"))
     }
+}
+
+fn should_retry_evernote_error(error: &thrift::Error) -> bool {
+    matches!(
+        error,
+        thrift::Error::Transport(_) | thrift::Error::Protocol(_) | thrift::Error::Application(_)
+    )
+}
+
+fn create_note_retry_delay(backoff_index: usize) -> Duration {
+    CREATE_NOTE_RETRY_BACKOFFS
+        .get(backoff_index)
+        .copied()
+        .unwrap_or(
+            *CREATE_NOTE_RETRY_BACKOFFS
+                .last()
+                .expect("Evernote backoff exists"),
+        )
+}
+
+fn source_url_search_query(source_url: &str) -> String {
+    format!("sourceURL:{}", evernote_search_phrase(source_url))
+}
+
+fn evernote_search_phrase(value: &str) -> String {
+    let escaped = value.replace('\\', "\\\\").replace('"', "\\\"");
+    format!("\"{escaped}\"")
 }
 
 fn note_resources(
@@ -456,9 +585,10 @@ mod tests {
 
     #[derive(Default)]
     struct MockHttpClientInner {
-        responses: VecDeque<Vec<u8>>,
+        responses: VecDeque<Result<Vec<u8>, String>>,
         calls: Vec<MockCall>,
         create_requests: Vec<note_store::NoteStoreCreateNoteArgs>,
+        find_metadata_requests: Vec<note_store::NoteStoreFindNotesMetadataArgs>,
     }
 
     #[derive(Clone, Debug, PartialEq, Eq)]
@@ -473,7 +603,15 @@ mod tests {
                 .lock()
                 .expect("mock lock")
                 .responses
-                .push_back(response);
+                .push_back(Ok(response));
+        }
+
+        fn push_error(&self, error: impl Into<String>) {
+            self.inner
+                .lock()
+                .expect("mock lock")
+                .responses
+                .push_back(Err(error.into()));
         }
 
         fn calls(&self) -> Vec<MockCall> {
@@ -487,49 +625,80 @@ mod tests {
                 .create_requests
                 .clone()
         }
+
+        fn find_metadata_requests(&self) -> Vec<note_store::NoteStoreFindNotesMetadataArgs> {
+            self.inner
+                .lock()
+                .expect("mock lock")
+                .find_metadata_requests
+                .clone()
+        }
     }
 
     impl ThriftHttpClient for MockHttpClient {
         fn post_thrift(&self, url: &str, body: Vec<u8>) -> Result<Vec<u8>, String> {
-            let (method, create_request) = parse_mock_request(&body)?;
+            let request = parse_mock_request(&body)?;
             let mut inner = self.inner.lock().expect("mock lock");
             inner.calls.push(MockCall {
                 url: url.to_string(),
-                method,
+                method: request.method,
             });
-            if let Some(create_request) = create_request {
+            if let Some(create_request) = request.create_note {
                 inner.create_requests.push(create_request);
+            }
+            if let Some(find_metadata_request) = request.find_notes_metadata {
+                inner.find_metadata_requests.push(find_metadata_request);
             }
             inner
                 .responses
                 .pop_front()
-                .ok_or_else(|| "No mock Evernote response queued.".to_string())
+                .unwrap_or_else(|| Err("No mock Evernote response queued.".to_string()))
         }
     }
 
-    fn parse_mock_request(
-        body: &[u8],
-    ) -> Result<(String, Option<note_store::NoteStoreCreateNoteArgs>), String> {
+    struct MockRequest {
+        method: String,
+        create_note: Option<note_store::NoteStoreCreateNoteArgs>,
+        find_notes_metadata: Option<note_store::NoteStoreFindNotesMetadataArgs>,
+    }
+
+    fn parse_mock_request(body: &[u8]) -> Result<MockRequest, String> {
         let mut protocol = TBinaryInputProtocol::new(Cursor::new(body.to_vec()), true);
         let message = protocol
             .read_message_begin()
             .map_err(|error| error.to_string())?;
         let method = message.name.clone();
-        let create_request = if method == "createNote" {
-            Some(
-                note_store::NoteStoreCreateNoteArgs::read_from_in_protocol(&mut protocol)
+        let mut create_note = None;
+        let mut find_notes_metadata = None;
+        match method.as_str() {
+            "createNote" => {
+                create_note = Some(
+                    note_store::NoteStoreCreateNoteArgs::read_from_in_protocol(&mut protocol)
+                        .map_err(|error| error.to_string())?,
+                );
+            }
+            "findNotesMetadata" => {
+                find_notes_metadata = Some(
+                    note_store::NoteStoreFindNotesMetadataArgs::read_from_in_protocol(
+                        &mut protocol,
+                    )
                     .map_err(|error| error.to_string())?,
-            )
-        } else {
-            protocol
-                .skip(TType::Struct)
-                .map_err(|error| error.to_string())?;
-            None
+                );
+            }
+            _ => {
+                protocol
+                    .skip(TType::Struct)
+                    .map_err(|error| error.to_string())?;
+            }
         };
         protocol
             .read_message_end()
             .map_err(|error| error.to_string())?;
-        Ok((method, create_request))
+        Ok(MockRequest {
+            method,
+            create_note,
+            find_notes_metadata,
+        })
     }
 
     fn thrift_response(
@@ -619,6 +788,49 @@ mod tests {
         })
     }
 
+    fn find_notes_metadata_response(notes: Vec<note_store::NoteMetadata>) -> Vec<u8> {
+        let result = note_store::NoteStoreFindNotesMetadataResult {
+            result_value: Some(note_store::NotesMetadataList {
+                start_index: 0,
+                total_notes: i32::try_from(notes.len()).unwrap_or(i32::MAX),
+                notes,
+                stopped_words: None,
+                searched_words: None,
+                update_count: None,
+                search_context_bytes: None,
+                debug_info: None,
+            }),
+            user_exception: None,
+            system_exception: None,
+            not_found_exception: None,
+        };
+        thrift_response("findNotesMetadata", |protocol| {
+            result
+                .write_to_out_protocol(protocol)
+                .expect("write find notes metadata result")
+        })
+    }
+
+    fn note_metadata_with_source(guid: &str, source_url: &str) -> note_store::NoteMetadata {
+        note_store::NoteMetadata {
+            guid: guid.to_string(),
+            title: Some("Title".to_string()),
+            content_length: None,
+            created: None,
+            updated: None,
+            deleted: None,
+            update_sequence_num: None,
+            notebook_guid: Some(NOTEBOOK_GUID.to_string()),
+            tag_guids: None,
+            attributes: Some(types::NoteAttributes {
+                source_u_r_l: Some(source_url.to_string()),
+                ..types::NoteAttributes::default()
+            }),
+            largest_resource_mime: None,
+            largest_resource_size: None,
+        }
+    }
+
     #[test]
     fn create_track_note_sends_create_note_request() {
         let http = MockHttpClient::default();
@@ -670,6 +882,101 @@ mod tests {
                 .and_then(|attributes| attributes.source_u_r_l.as_deref()),
             Some(SOURCE_URL)
         );
+    }
+
+    #[test]
+    fn create_track_note_retries_transient_transport_error() {
+        let http = MockHttpClient::default();
+        http.push_error("temporary transport error");
+        http.push_response(find_notes_metadata_response(Vec::new()));
+        http.push_response(create_note_response("note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+
+        let guid = client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
+                None,
+            )
+            .expect("retry create note");
+
+        assert_eq!(guid, "note-guid");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "findNotesMetadata".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+            ]
+        );
+        assert_eq!(http.create_requests().len(), 2);
+        let find_requests = http.find_metadata_requests();
+        assert_eq!(find_requests.len(), 1);
+        assert_eq!(
+            find_requests[0].filter.words.as_deref(),
+            Some(r#"sourceURL:"https://music.yandex.com/track/123""#)
+        );
+    }
+
+    #[test]
+    fn create_track_note_uses_existing_note_found_after_transport_error() {
+        let http = MockHttpClient::default();
+        http.push_error("temporary transport error after create");
+        http.push_response(find_notes_metadata_response(vec![
+            note_metadata_with_source("existing-note-guid", SOURCE_URL),
+        ]));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+
+        let guid = client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
+                None,
+            )
+            .expect("existing note");
+
+        assert_eq!(guid, "existing-note-guid");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "findNotesMetadata".to_string()
+                },
+            ]
+        );
+        assert_eq!(http.create_requests().len(), 1);
     }
 
     #[test]
