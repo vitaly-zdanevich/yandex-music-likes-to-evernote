@@ -37,6 +37,12 @@ pub struct Settings {
     pub enrich_external_links: bool,
     #[arg(long, env = "GENIUS_ACCESS_TOKEN")]
     pub genius_access_token: Option<String>,
+    #[arg(long, env = "ACOUSTID_API_KEY")]
+    pub acoustid_api_key: Option<String>,
+    #[arg(long, env = "ENABLED_EXTERNAL_LINK_SERVICES", default_value = "")]
+    pub enabled_external_link_services: String,
+    #[arg(long, env = "DISABLED_EXTERNAL_LINK_SERVICES", default_value = "")]
+    pub disabled_external_link_services: String,
     #[arg(long, env = "SONGLINK_USER_COUNTRY", default_value = "US")]
     pub songlink_user_country: String,
 }
@@ -65,6 +71,14 @@ impl Settings {
             .genius_access_token
             .map(|token| token.trim().to_string())
             .filter(|token| !token.is_empty());
+        self.acoustid_api_key = self
+            .acoustid_api_key
+            .map(|token| token.trim().to_string())
+            .filter(|token| !token.is_empty());
+        self.enabled_external_link_services =
+            parse_optional_comma_separated(&self.enabled_external_link_services).join(",");
+        self.disabled_external_link_services =
+            parse_optional_comma_separated(&self.disabled_external_link_services).join(",");
         self.songlink_user_country = self.songlink_user_country.trim().to_uppercase();
 
         if self.songlink_user_country.len() != 2 {
@@ -78,6 +92,14 @@ impl Settings {
 
     pub fn evernote_tag_names(&self) -> Result<Vec<String>> {
         parse_comma_separated("EVERNOTE_TAGS", &self.evernote_tags)
+    }
+
+    pub fn enabled_external_link_service_names(&self) -> Vec<String> {
+        parse_optional_comma_separated(&self.enabled_external_link_services)
+    }
+
+    pub fn disabled_external_link_service_names(&self) -> Vec<String> {
+        parse_optional_comma_separated(&self.disabled_external_link_services)
     }
 }
 
@@ -101,6 +123,15 @@ fn parse_comma_separated(name: &str, value: &str) -> Result<Vec<String>> {
     Ok(items)
 }
 
+fn parse_optional_comma_separated(value: &str) -> Vec<String> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|item| !item.is_empty())
+        .map(|item| item.to_ascii_lowercase())
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -119,6 +150,9 @@ mod tests {
             backup_audio: true,
             enrich_external_links: true,
             genius_access_token: None,
+            acoustid_api_key: None,
+            enabled_external_link_services: String::new(),
+            disabled_external_link_services: String::new(),
             songlink_user_country: "US".to_string(),
         }
     }
@@ -202,6 +236,9 @@ mod tests {
         settings.evernote_user_store_url = " https://example.test/user ".to_string();
         settings.evernote_notebook_guid = Some(" Music Inbox ".to_string());
         settings.genius_access_token = Some(" genius-token ".to_string());
+        settings.acoustid_api_key = Some(" acoustid-token ".to_string());
+        settings.enabled_external_link_services = " Spotify, Songlink ".to_string();
+        settings.disabled_external_link_services = " Genius, VK ".to_string();
         settings.songlink_user_country = "ge".to_string();
 
         let settings = settings.validate().expect("valid settings");
@@ -221,6 +258,17 @@ mod tests {
         assert_eq!(
             settings.genius_access_token.as_deref(),
             Some("genius-token")
+        );
+        assert_eq!(settings.acoustid_api_key.as_deref(), Some("acoustid-token"));
+        assert_eq!(settings.enabled_external_link_services, "spotify,songlink");
+        assert_eq!(settings.disabled_external_link_services, "genius,vk");
+        assert_eq!(
+            settings.enabled_external_link_service_names(),
+            vec!["spotify", "songlink"]
+        );
+        assert_eq!(
+            settings.disabled_external_link_service_names(),
+            vec!["genius", "vk"]
         );
         assert_eq!(settings.songlink_user_country, "GE");
     }

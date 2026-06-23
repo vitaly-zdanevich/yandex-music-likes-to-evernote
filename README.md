@@ -23,6 +23,7 @@ Set these GitHub Actions repository secrets:
 - `YANDEX_MUSIC_TOKEN`: Yandex Music OAuth token.
 - `EVERNOTE_AUTH_TOKEN`: Evernote OAuth/developer auth token with note write access.
 - `GENIUS_ACCESS_TOKEN`: optional Genius API token from [Genius API Clients](https://genius.com/api-clients). Without it, the tool adds a Genius search link instead of resolving a matched song URL.
+- `ACOUSTID_API_KEY`: optional AcoustID application API key from [AcoustID](https://acoustid.org/new-application). When set together with `BACKUP_AUDIO=true`, the tool fingerprints the downloaded audio with `fpcalc` and tries to add exact MusicBrainz recording, artist, and album links. Without it, the tool uses MusicBrainz metadata search links.
 
 Optional GitHub Actions repository secrets or variables:
 
@@ -37,10 +38,16 @@ Optional GitHub Actions repository variables:
 - `DRY_RUN`: set to `true` to print notes without creating them.
 - `MAX_TRACKS_PER_RUN`: cap created notes per run. Set to `0` to disable the cap. Defaults to `30`.
 - `BACKUP_AUDIO`: download each track's audio in the highest available quality (no re-encoding) and attach it to its note. Defaults to `true`. Lossless FLAC requires a Yandex Plus subscription tier that grants it; otherwise the best available lossy stream is used. Attachments count against your Evernote note-size and monthly upload limits, so set this to `false` if you want metadata-only notes. If a download fails transiently, the track is left unprocessed and retried on the next run rather than saved without audio. See [Audio backup](#audio-backup) for the resulting file formats.
-- `ENRICH_EXTERNAL_LINKS`: add external MusicBrainz, LRCLIB, Songlink/Odesli, Wikidata, Wikipedia, YouTube, and Genius links. Defaults to `true`.
+- `ENRICH_EXTERNAL_LINKS`: add external AcoustID/MusicBrainz, LRCLIB, Songlink/Odesli, Spotify, Apple Music, Deezer, Bandcamp, SoundCloud, Discogs, TIDAL, Qobuz, Amazon Music, YouTube Music, Beatport, WhoSampled, SecondHandSongs, AllMusic, ListenBrainz, TheAudioDB, VK, RuTracker, Rutube, Vimeo, Google, DuckDuckGo, Bing, Yandex, Last.fm, Wikidata, Wikipedia, YouTube, and Genius links. Defaults to `true`.
+- `ENABLED_EXTERNAL_LINK_SERVICES`: optional comma-separated whitelist. If non-empty, only listed services are used.
+- `DISABLED_EXTERNAL_LINK_SERVICES`: optional comma-separated blocklist. Applied after `ENABLED_EXTERNAL_LINK_SERVICES`, so it can remove services from a whitelist.
 - `SONGLINK_USER_COUNTRY`: optional two-letter country code for Songlink/Odesli lookup. Defaults to `US`.
 
-External enrichment sends artist/title/album/link metadata to the selected public services. It never copies lyrics into Evernote.
+Service ids for the whitelist/blocklist: `acoustid`, `allmusic`, `amazonmusic`, `applemusic`, `bandcamp`, `beatport`, `bing`, `deezer`, `discogs`, `duckduckgo`, `genius`, `google`, `lastfm`, `listenbrainz`, `lrclib`, `musicbrainz`, `qobuz`, `rutracker`, `rutube`, `secondhandsongs`, `songlink`, `soundcloud`, `spotify`, `theaudiodb`, `tidal`, `vimeo`, `vk`, `wikidata`, `wikipedia`, `yandex`, `youtube`, `youtubemusic`. Punctuation and case are ignored, so `last.fm`, `youtube-music`, and `VK` are accepted.
+
+External enrichment sends artist/title/album/link metadata to the selected public services. AcoustID sends the local audio fingerprint and duration, not the audio file itself. It never copies lyrics into Evernote.
+
+When `ACOUSTID_API_KEY` is present in GitHub Actions, the sync workflow installs `fpcalc` automatically from `libchromaprint-tools`. For local AcoustID lookup, install the same Chromaprint tool yourself and make sure `fpcalc` is in `PATH`.
 
 ## Audio backup
 

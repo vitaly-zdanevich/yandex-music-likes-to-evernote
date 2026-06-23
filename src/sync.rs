@@ -25,6 +25,9 @@ pub fn run(settings: Settings) -> Result<()> {
         Some(EnrichmentClient::new(
             settings.genius_access_token.clone(),
             settings.songlink_user_country.clone(),
+            settings.acoustid_api_key.clone(),
+            settings.enabled_external_link_service_names(),
+            settings.disabled_external_link_service_names(),
         )?)
     } else {
         None
@@ -50,26 +53,9 @@ pub fn run(settings: Settings) -> Result<()> {
     let mut saved_count = 0usize;
     for track in new_tracks {
         let title = note::title(&track);
-        let external_links = if let Some(enrichment) = &enrichment {
-            runtime.block_on(enrichment.links_for(&track))
-        } else {
-            Vec::new()
-        };
-
-        if settings.dry_run {
-            info!(
-                track_id = track.id,
-                title = title,
-                url = track.yandex_url,
-                backup_audio = settings.backup_audio,
-                "dry-run: would create Evernote note"
-            );
-            continue;
-        }
-
-        let audio = if settings.backup_audio {
+        let downloaded_audio = if settings.backup_audio && !settings.dry_run {
             match runtime.block_on(yandex.download_audio(&track.id)) {
-                Ok(audio) => audio.map(|audio| AudioAttachment::new(audio, &title)),
+                Ok(audio) => audio,
                 Err(error) => {
                     // Transient failure (e.g. a flaky download host): leave the
                     // track unprocessed so the next run retries it with audio
@@ -86,6 +72,24 @@ pub fn run(settings: Settings) -> Result<()> {
             None
         };
 
+        let external_links = if let Some(enrichment) = &enrichment {
+            runtime.block_on(enrichment.links_for(&track, downloaded_audio.as_ref()))
+        } else {
+            Vec::new()
+        };
+
+        if settings.dry_run {
+            info!(
+                track_id = track.id,
+                title = title,
+                url = track.yandex_url,
+                backup_audio = settings.backup_audio,
+                "dry-run: would create Evernote note"
+            );
+            continue;
+        }
+
+        let audio = downloaded_audio.map(|audio| AudioAttachment::new(audio, &title));
         let content = note::enml(&track, &external_links, audio.as_ref());
         let guid = evernote.create_track_note(title.clone(), content, audio.as_ref())?;
         info!(

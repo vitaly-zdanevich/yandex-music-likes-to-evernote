@@ -25,10 +25,13 @@ jobs:
       EVERNOTE_NOTEBOOK_GUID: ${{ vars.EVERNOTE_NOTEBOOK_GUID }}
       EVERNOTE_TAGS: ${{ secrets.EVERNOTE_TAGS || vars.EVERNOTE_TAGS || 'yandex-music' }}
       GENIUS_ACCESS_TOKEN: ${{ secrets.GENIUS_ACCESS_TOKEN }}
+      ACOUSTID_API_KEY: ${{ secrets.ACOUSTID_API_KEY }}
       STATE_PATH: ${{ vars.STATE_PATH || 'state.json' }}
       DRY_RUN: ${{ vars.DRY_RUN || 'false' }}
       MAX_TRACKS_PER_RUN: ${{ vars.MAX_TRACKS_PER_RUN || '30' }}
       ENRICH_EXTERNAL_LINKS: ${{ vars.ENRICH_EXTERNAL_LINKS || 'true' }}
+      ENABLED_EXTERNAL_LINK_SERVICES: ${{ vars.ENABLED_EXTERNAL_LINK_SERVICES || '' }}
+      DISABLED_EXTERNAL_LINK_SERVICES: ${{ vars.DISABLED_EXTERNAL_LINK_SERVICES || '' }}
       SONGLINK_USER_COUNTRY: ${{ vars.SONGLINK_USER_COUNTRY || 'US' }}
 
     steps:
@@ -54,11 +57,19 @@ jobs:
           restore-keys: |
             rust-${{ runner.os }}-
 
+      - name: Install AcoustID fingerprint tool
+        if: ${{ env.ACOUSTID_API_KEY != '' }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes libchromaprint-tools
+
       - name: Sync liked tracks
         run: |
           export DRY_RUN="${DRY_RUN:-false}"
           export MAX_TRACKS_PER_RUN="${MAX_TRACKS_PER_RUN:-30}"
           export ENRICH_EXTERNAL_LINKS="${ENRICH_EXTERNAL_LINKS:-true}"
+          export ENABLED_EXTERNAL_LINK_SERVICES="${ENABLED_EXTERNAL_LINK_SERVICES:-}"
+          export DISABLED_EXTERNAL_LINK_SERVICES="${DISABLED_EXTERNAL_LINK_SERVICES:-}"
           export SONGLINK_USER_COUNTRY="${SONGLINK_USER_COUNTRY:-US}"
           cargo run --locked -- sync
 

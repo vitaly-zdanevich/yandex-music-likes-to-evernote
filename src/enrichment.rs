@@ -1,4 +1,7 @@
 use std::{
+    collections::HashSet,
+    io::{self, Write as _},
+    process::Command,
     sync::{
         Arc,
         atomic::{AtomicBool, Ordering},
@@ -6,22 +9,27 @@ use std::{
     time::Duration,
 };
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use reqwest::{
     StatusCode,
     header::{HeaderValue, RETRY_AFTER},
 };
 use serde::{Deserialize, Deserializer};
+use tempfile::Builder as TempFileBuilder;
 use tokio::time::sleep;
 use tracing::warn;
 use url::form_urlencoded;
 
+use crate::audio::TrackAudio;
 use crate::yandex::LikedTrack;
 
 const CLIENT_NAME: &str = concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(12);
 const MUSICBRAINZ_MIN_SCORE: i64 = 90;
 const MUSICBRAINZ_DURATION_TOLERANCE_MS: u128 = 7_000;
+const ACOUSTID_LOOKUP_URL: &str = "https://api.acoustid.org/v2/lookup";
+const ACOUSTID_META: &str = "recordings releasegroups compress";
+const ACOUSTID_MIN_SCORE: f64 = 0.80;
 const SONGLINK_MAX_ATTEMPTS: usize = 3;
 const SONGLINK_BACKOFFS: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
 const SONGLINK_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
@@ -41,64 +49,340 @@ impl ExternalLink {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum ExternalLinkService {
+    AcoustId,
+    AllMusic,
+    AmazonMusic,
+    AppleMusic,
+    Bandcamp,
+    Beatport,
+    Bing,
+    Deezer,
+    Discogs,
+    DuckDuckGo,
+    Genius,
+    Google,
+    LastFm,
+    ListenBrainz,
+    Lrclib,
+    MusicBrainz,
+    Qobuz,
+    RuTracker,
+    Rutube,
+    SecondHandSongs,
+    Songlink,
+    SoundCloud,
+    Spotify,
+    TheAudioDb,
+    Tidal,
+    Vimeo,
+    Vk,
+    WhoSampled,
+    Wikidata,
+    Wikipedia,
+    Yandex,
+    YouTube,
+    YouTubeMusic,
+}
+
+impl ExternalLinkService {
+    fn parse(name: &str) -> Option<Self> {
+        let normalized = name
+            .chars()
+            .filter(|ch| ch.is_ascii_alphanumeric())
+            .flat_map(char::to_lowercase)
+            .collect::<String>();
+        match normalized.as_str() {
+            "acoustid" => Some(Self::AcoustId),
+            "allmusic" => Some(Self::AllMusic),
+            "amazon" | "amazonmusic" => Some(Self::AmazonMusic),
+            "apple" | "applemusic" => Some(Self::AppleMusic),
+            "bandcamp" => Some(Self::Bandcamp),
+            "beatport" => Some(Self::Beatport),
+            "bing" => Some(Self::Bing),
+            "deezer" => Some(Self::Deezer),
+            "discogs" => Some(Self::Discogs),
+            "duckduckgo" | "ddg" => Some(Self::DuckDuckGo),
+            "genius" => Some(Self::Genius),
+            "google" => Some(Self::Google),
+            "lastfm" => Some(Self::LastFm),
+            "listenbrainz" => Some(Self::ListenBrainz),
+            "lrclib" => Some(Self::Lrclib),
+            "musicbrainz" => Some(Self::MusicBrainz),
+            "qobuz" => Some(Self::Qobuz),
+            "rutracker" => Some(Self::RuTracker),
+            "rutube" => Some(Self::Rutube),
+            "secondhandsongs" => Some(Self::SecondHandSongs),
+            "songlink" | "odesli" => Some(Self::Songlink),
+            "soundcloud" => Some(Self::SoundCloud),
+            "spotify" => Some(Self::Spotify),
+            "theaudiodb" | "audiodb" => Some(Self::TheAudioDb),
+            "tidal" => Some(Self::Tidal),
+            "vimeo" => Some(Self::Vimeo),
+            "vk" | "vkontakte" => Some(Self::Vk),
+            "wikidata" => Some(Self::Wikidata),
+            "wikipedia" => Some(Self::Wikipedia),
+            "yandex" => Some(Self::Yandex),
+            "youtube" => Some(Self::YouTube),
+            "youtubemusic" | "ytmusic" => Some(Self::YouTubeMusic),
+            _ => None,
+        }
+    }
+}
+
+const EXTERNAL_LINK_SERVICE_NAMES: &[&str] = &[
+    "acoustid",
+    "allmusic",
+    "amazonmusic",
+    "applemusic",
+    "bandcamp",
+    "beatport",
+    "bing",
+    "deezer",
+    "discogs",
+    "duckduckgo",
+    "genius",
+    "google",
+    "lastfm",
+    "listenbrainz",
+    "lrclib",
+    "musicbrainz",
+    "qobuz",
+    "rutracker",
+    "rutube",
+    "secondhandsongs",
+    "songlink",
+    "soundcloud",
+    "spotify",
+    "theaudiodb",
+    "tidal",
+    "vimeo",
+    "vk",
+    "wikidata",
+    "wikipedia",
+    "yandex",
+    "youtube",
+    "youtubemusic",
+];
+
 #[derive(Clone)]
 pub struct EnrichmentClient {
     http: reqwest::Client,
     genius_access_token: Option<String>,
+    acoustid_api_key: Option<String>,
     songlink_user_country: String,
     // Once Songlink keeps returning 429 after retries, avoid slowing every later
     // track in the same sync run with more calls that are likely to fail.
     songlink_rate_limited: Arc<AtomicBool>,
+    // Missing fpcalc is an environment problem, so warn once and skip later
+    // AcoustID attempts in the same run.
+    acoustid_fpcalc_missing: Arc<AtomicBool>,
+    enabled_services: HashSet<ExternalLinkService>,
+    disabled_services: HashSet<ExternalLinkService>,
 }
 
 impl EnrichmentClient {
     pub fn new(
         genius_access_token: Option<String>,
         songlink_user_country: impl Into<String>,
+        acoustid_api_key: Option<String>,
+        enabled_external_link_services: impl IntoIterator<Item = String>,
+        disabled_external_link_services: impl IntoIterator<Item = String>,
     ) -> Result<Self> {
         let http = reqwest::Client::builder()
             .user_agent(CLIENT_NAME)
             .timeout(REQUEST_TIMEOUT)
             .build()
             .context("failed to build enrichment HTTP client")?;
+        let enabled_services = parse_external_link_services(enabled_external_link_services)?;
+        let disabled_services = parse_external_link_services(disabled_external_link_services)?;
         Ok(Self {
             http,
             genius_access_token,
+            acoustid_api_key,
             songlink_user_country: songlink_user_country.into(),
             songlink_rate_limited: Arc::new(AtomicBool::new(false)),
+            acoustid_fpcalc_missing: Arc::new(AtomicBool::new(false)),
+            enabled_services,
+            disabled_services,
         })
     }
 
-    pub async fn links_for(&self, track: &LikedTrack) -> Vec<ExternalLink> {
+    pub async fn links_for(
+        &self,
+        track: &LikedTrack,
+        audio: Option<&TrackAudio>,
+    ) -> Vec<ExternalLink> {
         let mut links = Vec::new();
 
-        links.push(self.musicbrainz_link(track).await.unwrap_or_else(|| {
+        links.extend(self.musicbrainz_links(track, audio).await);
+
+        if self.service_enabled(ExternalLinkService::Lrclib) {
+            links.push(self.lrclib_link(track).await.unwrap_or_else(|| {
+                ExternalLink::new("LRCLIB lyrics search", lrclib_search_url(track))
+            }));
+        }
+
+        if self.service_enabled(ExternalLinkService::Songlink) {
+            links.push(self.songlink_link(track).await.unwrap_or_else(|| {
+                ExternalLink::new("Songlink/Odesli lookup", songlink_lookup_url(track))
+            }));
+        }
+
+        links.extend(related_music_service_links(
+            track,
+            &self.enabled_services,
+            &self.disabled_services,
+        ));
+        links.extend(wikimedia_links(
+            track,
+            &self.enabled_services,
+            &self.disabled_services,
+        ));
+
+        if self.service_enabled(ExternalLinkService::YouTube) {
+            links.push(ExternalLink::new(
+                "YouTube search",
+                youtube_search_url(track),
+            ));
+        }
+
+        if self.service_enabled(ExternalLinkService::Genius) {
+            links.push(
+                self.genius_link(track).await.unwrap_or_else(|| {
+                    ExternalLink::new("Genius search", genius_search_url(track))
+                }),
+            );
+        }
+
+        links
+    }
+
+    fn service_enabled(&self, service: ExternalLinkService) -> bool {
+        external_link_service_enabled(service, &self.enabled_services, &self.disabled_services)
+    }
+
+    fn should_try_acoustid(&self) -> bool {
+        self.service_enabled(ExternalLinkService::AcoustId)
+            && (self.service_enabled(ExternalLinkService::MusicBrainz)
+                || self.service_enabled(ExternalLinkService::ListenBrainz)
+                || self.service_enabled(ExternalLinkService::TheAudioDb))
+    }
+
+    /// Builds MusicBrainz links, preferring AcoustID fingerprint matches when
+    /// audio and an API key are available, then falling back to metadata search.
+    async fn musicbrainz_links(
+        &self,
+        track: &LikedTrack,
+        audio: Option<&TrackAudio>,
+    ) -> Vec<ExternalLink> {
+        if self.should_try_acoustid()
+            && let Some(mut links) = self.acoustid_musicbrainz_links(audio).await
+        {
+            if self.service_enabled(ExternalLinkService::MusicBrainz) {
+                add_missing_musicbrainz_search_links(&mut links, track);
+            }
+            return links;
+        }
+
+        if !self.service_enabled(ExternalLinkService::MusicBrainz) {
+            return Vec::new();
+        }
+
+        let mut links = vec![self.musicbrainz_link(track).await.unwrap_or_else(|| {
             ExternalLink::new(
                 "MusicBrainz recording search",
                 musicbrainz_search_url(track),
             )
-        }));
-
-        links.push(self.lrclib_link(track).await.unwrap_or_else(|| {
-            ExternalLink::new("LRCLIB lyrics search", lrclib_search_url(track))
-        }));
-
-        links.push(self.songlink_link(track).await.unwrap_or_else(|| {
-            ExternalLink::new("Songlink/Odesli lookup", songlink_lookup_url(track))
-        }));
-
-        links.extend(wikimedia_links(track));
-        links.push(ExternalLink::new(
-            "YouTube search",
-            youtube_search_url(track),
-        ));
-        links.push(
-            self.genius_link(track)
-                .await
-                .unwrap_or_else(|| ExternalLink::new("Genius search", genius_search_url(track))),
-        );
-
+        })];
+        links.extend(musicbrainz_entity_search_links(track));
         links
+    }
+
+    /// Uses AcoustID to resolve downloaded audio to exact MusicBrainz entities.
+    async fn acoustid_musicbrainz_links(
+        &self,
+        audio: Option<&TrackAudio>,
+    ) -> Option<Vec<ExternalLink>> {
+        let api_key = self.acoustid_api_key.as_ref()?;
+        let audio = audio?;
+
+        if self.acoustid_fpcalc_missing.load(Ordering::Relaxed) {
+            return None;
+        }
+
+        let fingerprint = match acoustid_fingerprint(audio) {
+            Ok(Some(fingerprint)) => fingerprint,
+            Ok(None) => {
+                self.acoustid_fpcalc_missing.store(true, Ordering::Relaxed);
+                warn!(
+                    "fpcalc is not installed; skipping AcoustID lookups for the rest of this run"
+                );
+                return None;
+            }
+            Err(error) => {
+                warn!(
+                    error = format!("{error:#}"),
+                    "AcoustID fingerprinting failed"
+                );
+                return None;
+            }
+        };
+
+        let duration = fingerprint.duration_seconds.to_string();
+        let response = match self
+            .http
+            .post(ACOUSTID_LOOKUP_URL)
+            .form(&[
+                ("client", api_key.as_str()),
+                ("meta", ACOUSTID_META),
+                ("duration", duration.as_str()),
+                ("fingerprint", fingerprint.fingerprint.as_str()),
+            ])
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "AcoustID lookup failed");
+                return None;
+            }
+        };
+
+        if !response.status().is_success() {
+            warn!(status = %response.status(), "AcoustID lookup returned non-success status");
+            return None;
+        }
+
+        let response = match response.json::<AcoustIdResponse>().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "AcoustID lookup returned invalid JSON");
+                return None;
+            }
+        };
+
+        if response.status != "ok" {
+            warn!(
+                status = response.status,
+                message = response
+                    .error
+                    .as_ref()
+                    .map(|error| error.message.as_str())
+                    .unwrap_or("unknown"),
+                "AcoustID lookup returned an error"
+            );
+            return None;
+        }
+
+        let recording = best_acoustid_recording(response)?;
+        let links = musicbrainz_links_from_acoustid_recording(
+            &recording,
+            &self.enabled_services,
+            &self.disabled_services,
+        );
+        if links.is_empty() { None } else { Some(links) }
     }
 
     async fn musicbrainz_link(&self, track: &LikedTrack) -> Option<ExternalLink> {
@@ -256,6 +540,35 @@ impl EnrichmentClient {
     }
 }
 
+fn parse_external_link_services(
+    names: impl IntoIterator<Item = String>,
+) -> Result<HashSet<ExternalLinkService>> {
+    let mut services = HashSet::new();
+    for name in names {
+        let trimmed = name.trim();
+        if trimmed.is_empty() {
+            continue;
+        }
+        let service = ExternalLinkService::parse(trimmed).ok_or_else(|| {
+            anyhow!(
+                "unknown external link service `{trimmed}`; known values: {}",
+                EXTERNAL_LINK_SERVICE_NAMES.join(", ")
+            )
+        })?;
+        services.insert(service);
+    }
+    Ok(services)
+}
+
+fn external_link_service_enabled(
+    service: ExternalLinkService,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> bool {
+    (enabled_services.is_empty() || enabled_services.contains(&service))
+        && !disabled_services.contains(&service)
+}
+
 /// Picks the next Songlink retry delay, preferring a valid Retry-After header.
 fn songlink_retry_delay(retry_after: Option<&HeaderValue>, backoff_index: usize) -> Duration {
     retry_after
@@ -293,8 +606,229 @@ fn musicbrainz_recording_matches(recording: &MusicBrainzRecording, track: &Liked
     true
 }
 
-fn wikimedia_links(track: &LikedTrack) -> Vec<ExternalLink> {
+/// Adds metadata search links for MusicBrainz entities that were not resolved
+/// exactly through AcoustID.
+fn add_missing_musicbrainz_search_links(links: &mut Vec<ExternalLink>, track: &LikedTrack) {
+    let has_artist = links.iter().any(|link| link.label == "MusicBrainz artist");
+    let has_album = links.iter().any(|link| link.label == "MusicBrainz album");
+
+    for link in musicbrainz_entity_search_links(track) {
+        match link.label.as_str() {
+            "MusicBrainz artist search" if !has_artist => links.push(link),
+            "MusicBrainz album search" if !has_album => links.push(link),
+            _ => {}
+        }
+    }
+}
+
+/// Runs Chromaprint's `fpcalc` helper over the downloaded audio and returns the
+/// fingerprint fields required by the AcoustID lookup API.
+fn acoustid_fingerprint(audio: &TrackAudio) -> Result<Option<AcoustIdFingerprint>> {
+    if audio.bytes.is_empty() {
+        return Err(anyhow!("downloaded audio is empty"));
+    }
+
+    let mut file = TempFileBuilder::new()
+        .suffix(&format!(".{}", audio.extension()))
+        .tempfile()
+        .context("failed to create temporary audio file for AcoustID fingerprinting")?;
+    file.write_all(&audio.bytes)
+        .context("failed to write temporary audio file for AcoustID fingerprinting")?;
+    file.flush()
+        .context("failed to flush temporary audio file for AcoustID fingerprinting")?;
+
+    let output = match Command::new("fpcalc")
+        .arg("-json")
+        .arg(file.path())
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error).context("failed to run fpcalc"),
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        return Err(anyhow!(
+            "fpcalc exited with {}: {}",
+            output.status,
+            stderr.trim()
+        ));
+    }
+
+    let output = serde_json::from_slice::<FpcalcOutput>(&output.stdout)
+        .context("failed to parse fpcalc JSON output")?;
+    if output.fingerprint.trim().is_empty() {
+        return Err(anyhow!("fpcalc returned an empty fingerprint"));
+    }
+    if !output.duration.is_finite() || output.duration <= 0.0 {
+        return Err(anyhow!("fpcalc returned an invalid duration"));
+    }
+
+    Ok(Some(AcoustIdFingerprint {
+        duration_seconds: output.duration.round() as u64,
+        fingerprint: output.fingerprint,
+    }))
+}
+
+/// Picks the strongest AcoustID result that is confident enough and linked to a
+/// MusicBrainz recording.
+fn best_acoustid_recording(mut response: AcoustIdResponse) -> Option<AcoustIdRecording> {
+    response
+        .results
+        .sort_by(|left, right| right.score.total_cmp(&left.score));
+
+    response
+        .results
+        .into_iter()
+        .filter(|result| result.score >= ACOUSTID_MIN_SCORE)
+        .flat_map(|result| result.recordings)
+        .find(|recording| !recording.id.trim().is_empty())
+}
+
+/// Converts an AcoustID MusicBrainz match into direct entity links.
+fn musicbrainz_links_from_acoustid_recording(
+    recording: &AcoustIdRecording,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Vec<ExternalLink> {
     let mut links = Vec::new();
+
+    if !recording.id.trim().is_empty() {
+        if external_link_service_enabled(
+            ExternalLinkService::MusicBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "MusicBrainz recording",
+                format!("https://musicbrainz.org/recording/{}", recording.id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::ListenBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "ListenBrainz recording metadata",
+                listenbrainz_recording_metadata_url(&recording.id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::TheAudioDb,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "TheAudioDB track MBID lookup",
+                theaudiodb_track_mbid_url(&recording.id),
+            ));
+        }
+    }
+
+    if let Some(artist) = recording
+        .artists
+        .iter()
+        .find(|artist| !artist.id.trim().is_empty())
+    {
+        if external_link_service_enabled(
+            ExternalLinkService::MusicBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "MusicBrainz artist",
+                format!("https://musicbrainz.org/artist/{}", artist.id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::TheAudioDb,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "TheAudioDB artist MBID lookup",
+                theaudiodb_artist_mbid_url(&artist.id),
+            ));
+        }
+    }
+
+    if let Some(release_group) = recording
+        .releasegroups
+        .iter()
+        .find(|release_group| !release_group.id.trim().is_empty())
+    {
+        if external_link_service_enabled(
+            ExternalLinkService::MusicBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "MusicBrainz album",
+                format!("https://musicbrainz.org/release-group/{}", release_group.id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::TheAudioDb,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "TheAudioDB album MBID lookup",
+                theaudiodb_album_mbid_url(&release_group.id),
+            ));
+        }
+    }
+
+    links
+}
+
+/// Builds extra MusicBrainz entity searches for artist and album context.
+fn musicbrainz_entity_search_links(track: &LikedTrack) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+
+    if let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    {
+        links.push(ExternalLink::new(
+            "MusicBrainz artist search",
+            musicbrainz_artist_search_url(artist),
+        ));
+
+        if let Some(album) = track
+            .albums
+            .first()
+            .filter(|album| !album.trim().is_empty())
+        {
+            links.push(ExternalLink::new(
+                "MusicBrainz album search",
+                musicbrainz_album_search_url(&format!("{artist} {album}")),
+            ));
+        }
+    }
+
+    links
+}
+
+fn wikimedia_links(
+    track: &LikedTrack,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+    let wikidata_enabled = external_link_service_enabled(
+        ExternalLinkService::Wikidata,
+        enabled_services,
+        disabled_services,
+    );
+    let wikipedia_enabled = external_link_service_enabled(
+        ExternalLinkService::Wikipedia,
+        enabled_services,
+        disabled_services,
+    );
 
     let track_query = if let Some(artist) = track
         .artists
@@ -305,7 +839,7 @@ fn wikimedia_links(track: &LikedTrack) -> Vec<ExternalLink> {
     } else {
         track.title.clone()
     };
-    if !track_query.trim().is_empty() {
+    if wikidata_enabled && !track_query.trim().is_empty() {
         links.push(ExternalLink::new(
             "Wikidata track search",
             wikidata_search_url(&track_query),
@@ -317,14 +851,18 @@ fn wikimedia_links(track: &LikedTrack) -> Vec<ExternalLink> {
         .first()
         .filter(|artist| !artist.trim().is_empty())
     {
-        links.push(ExternalLink::new(
-            "Wikidata artist search",
-            wikidata_search_url(artist),
-        ));
-        links.push(ExternalLink::new(
-            "Wikipedia artist search",
-            wikipedia_search_url(artist),
-        ));
+        if wikidata_enabled {
+            links.push(ExternalLink::new(
+                "Wikidata artist search",
+                wikidata_search_url(artist),
+            ));
+        }
+        if wikipedia_enabled {
+            links.push(ExternalLink::new(
+                "Wikipedia artist search",
+                wikipedia_search_url(artist),
+            ));
+        }
     }
 
     if let Some(album) = track
@@ -337,13 +875,262 @@ fn wikimedia_links(track: &LikedTrack) -> Vec<ExternalLink> {
         } else {
             album.clone()
         };
+        if wikidata_enabled {
+            links.push(ExternalLink::new(
+                "Wikidata album search",
+                wikidata_search_url(&query),
+            ));
+        }
+        if wikipedia_enabled {
+            links.push(ExternalLink::new(
+                "Wikipedia album search",
+                wikipedia_search_url(&query),
+            ));
+        }
+    }
+
+    links
+}
+
+/// Builds no-token search links for other music catalogs and metadata sites.
+fn related_music_service_links(
+    track: &LikedTrack,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Vec<ExternalLink> {
+    let query = human_query(track);
+    if query.is_empty() {
+        return Vec::new();
+    }
+
+    let mut links = Vec::new();
+    let mut push_link = |service, link: ExternalLink| {
+        if external_link_service_enabled(service, enabled_services, disabled_services) {
+            links.push(link);
+        }
+    };
+
+    push_link(
+        ExternalLinkService::Spotify,
+        ExternalLink::new("Spotify search", spotify_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::AppleMusic,
+        ExternalLink::new("Apple Music search", apple_music_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Deezer,
+        ExternalLink::new("Deezer search", deezer_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Bandcamp,
+        ExternalLink::new("Bandcamp search", bandcamp_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::SoundCloud,
+        ExternalLink::new("SoundCloud search", soundcloud_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Discogs,
+        ExternalLink::new("Discogs search", discogs_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Tidal,
+        ExternalLink::new("TIDAL search", tidal_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Qobuz,
+        ExternalLink::new("Qobuz search", qobuz_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::AmazonMusic,
+        ExternalLink::new("Amazon Music search", amazon_music_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::YouTubeMusic,
+        ExternalLink::new("YouTube Music search", youtube_music_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Beatport,
+        ExternalLink::new("Beatport search", beatport_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::WhoSampled,
+        ExternalLink::new("WhoSampled search", whosampled_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::SecondHandSongs,
+        ExternalLink::new("SecondHandSongs search", secondhandsongs_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::AllMusic,
+        ExternalLink::new("AllMusic search", allmusic_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::ListenBrainz,
+        ExternalLink::new("ListenBrainz search", listenbrainz_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Vk,
+        ExternalLink::new("VK Music search", vk_music_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Rutube,
+        ExternalLink::new("Rutube search", rutube_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Vimeo,
+        ExternalLink::new("Vimeo search", vimeo_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Google,
+        ExternalLink::new("Google search", google_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::DuckDuckGo,
+        ExternalLink::new("DuckDuckGo search", duckduckgo_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Bing,
+        ExternalLink::new("Bing search", bing_search_url(&query)),
+    );
+    push_link(
+        ExternalLinkService::Yandex,
+        ExternalLink::new("Yandex search", yandex_search_url(&query)),
+    );
+
+    if external_link_service_enabled(
+        ExternalLinkService::LastFm,
+        enabled_services,
+        disabled_services,
+    ) {
+        links.extend(lastfm_links(track));
+    }
+    if external_link_service_enabled(
+        ExternalLinkService::TheAudioDb,
+        enabled_services,
+        disabled_services,
+    ) {
+        links.extend(theaudiodb_search_links(track));
+    }
+    if external_link_service_enabled(
+        ExternalLinkService::RuTracker,
+        enabled_services,
+        disabled_services,
+    ) {
+        links.extend(rutracker_links(track));
+    }
+    links
+}
+
+/// Builds public TheAudioDB search API links. TheAudioDB's HTML search pages are
+/// not stable, so these links point at its documented JSON search endpoints.
+fn theaudiodb_search_links(track: &LikedTrack) -> Vec<ExternalLink> {
+    let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    else {
+        return Vec::new();
+    };
+
+    let mut links = vec![ExternalLink::new(
+        "TheAudioDB artist search",
+        theaudiodb_artist_search_url(artist),
+    )];
+
+    if !track.title.trim().is_empty() {
         links.push(ExternalLink::new(
-            "Wikidata album search",
-            wikidata_search_url(&query),
+            "TheAudioDB track search",
+            theaudiodb_track_search_url(artist, &track.title),
+        ));
+    }
+
+    if let Some(album) = track
+        .albums
+        .first()
+        .filter(|album| !album.trim().is_empty())
+    {
+        links.push(ExternalLink::new(
+            "TheAudioDB album search",
+            theaudiodb_album_search_url(artist, album),
+        ));
+    }
+
+    links
+}
+
+/// Builds typed Last.fm searches because it has separate artist, album, and
+/// track result pages.
+fn lastfm_links(track: &LikedTrack) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+
+    if let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    {
+        links.push(ExternalLink::new(
+            "Last.fm artist search",
+            lastfm_artist_search_url(artist),
         ));
         links.push(ExternalLink::new(
-            "Wikipedia album search",
-            wikipedia_search_url(&query),
+            "Last.fm track search",
+            lastfm_track_search_url(&format!("{artist} {}", track.title)),
+        ));
+
+        if let Some(album) = track
+            .albums
+            .first()
+            .filter(|album| !album.trim().is_empty())
+        {
+            links.push(ExternalLink::new(
+                "Last.fm album search",
+                lastfm_album_search_url(&format!("{artist} {album}")),
+            ));
+        }
+    } else {
+        links.push(ExternalLink::new(
+            "Last.fm track search",
+            lastfm_track_search_url(&track.title),
+        ));
+    }
+
+    links
+}
+
+/// Builds typed RuTracker searches for artist, track, and album.
+fn rutracker_links(track: &LikedTrack) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+
+    if let Some(artist) = track
+        .artists
+        .first()
+        .filter(|artist| !artist.trim().is_empty())
+    {
+        links.push(ExternalLink::new(
+            "RuTracker artist search",
+            rutracker_search_url(artist),
+        ));
+        links.push(ExternalLink::new(
+            "RuTracker track search",
+            rutracker_search_url(&format!("{artist} {}", track.title)),
+        ));
+
+        if let Some(album) = track
+            .albums
+            .first()
+            .filter(|album| !album.trim().is_empty())
+        {
+            links.push(ExternalLink::new(
+                "RuTracker album search",
+                rutracker_search_url(&format!("{artist} {album}")),
+            ));
+        }
+    } else {
+        links.push(ExternalLink::new(
+            "RuTracker track search",
+            rutracker_search_url(&track.title),
         ));
     }
 
@@ -367,6 +1154,24 @@ fn musicbrainz_search_url(track: &LikedTrack) -> String {
         &[
             ("query", &human_query(track)),
             ("type", "recording"),
+            ("method", "indexed"),
+        ],
+    )
+}
+
+fn musicbrainz_artist_search_url(query: &str) -> String {
+    query_url(
+        "https://musicbrainz.org/search",
+        &[("query", query), ("type", "artist"), ("method", "indexed")],
+    )
+}
+
+fn musicbrainz_album_search_url(query: &str) -> String {
+    query_url(
+        "https://musicbrainz.org/search",
+        &[
+            ("query", query),
+            ("type", "release_group"),
             ("method", "indexed"),
         ],
     )
@@ -446,6 +1251,168 @@ fn genius_search_url(track: &LikedTrack) -> String {
     query_url("https://genius.com/search", &[("q", &human_query(track))])
 }
 
+fn spotify_search_url(query: &str) -> String {
+    query_url("https://open.spotify.com/search", &[("q", query)])
+}
+
+fn apple_music_search_url(query: &str) -> String {
+    query_url("https://music.apple.com/search", &[("term", query)])
+}
+
+fn deezer_search_url(query: &str) -> String {
+    query_url("https://www.deezer.com/search", &[("q", query)])
+}
+
+fn bandcamp_search_url(query: &str) -> String {
+    query_url("https://bandcamp.com/search", &[("q", query)])
+}
+
+fn soundcloud_search_url(query: &str) -> String {
+    query_url("https://soundcloud.com/search", &[("q", query)])
+}
+
+fn discogs_search_url(query: &str) -> String {
+    query_url("https://www.discogs.com/search/", &[("q", query)])
+}
+
+fn tidal_search_url(query: &str) -> String {
+    path_search_url("https://tidal.com/search", query)
+}
+
+fn qobuz_search_url(query: &str) -> String {
+    path_search_url("https://play.qobuz.com/search", query)
+}
+
+fn amazon_music_search_url(query: &str) -> String {
+    path_search_url("https://music.amazon.com/search", query)
+}
+
+fn youtube_music_search_url(query: &str) -> String {
+    query_url("https://music.youtube.com/search", &[("q", query)])
+}
+
+fn beatport_search_url(query: &str) -> String {
+    query_url("https://www.beatport.com/search", &[("q", query)])
+}
+
+fn whosampled_search_url(query: &str) -> String {
+    query_url("https://www.whosampled.com/search/", &[("q", query)])
+}
+
+fn secondhandsongs_search_url(query: &str) -> String {
+    query_url(
+        "https://secondhandsongs.com/search",
+        &[("search_text", query)],
+    )
+}
+
+fn allmusic_search_url(query: &str) -> String {
+    path_search_url("https://www.allmusic.com/search/all", query)
+}
+
+fn listenbrainz_search_url(query: &str) -> String {
+    query_url("https://listenbrainz.org/search/", &[("q", query)])
+}
+
+fn vk_music_search_url(query: &str) -> String {
+    query_url(
+        "https://vk.com/search",
+        &[("c[q]", query), ("c[section]", "audio")],
+    )
+}
+
+fn rutube_search_url(query: &str) -> String {
+    query_url("https://rutube.ru/search/", &[("query", query)])
+}
+
+fn rutracker_search_url(query: &str) -> String {
+    query_url("https://rutracker.org/forum/tracker.php", &[("nm", query)])
+}
+
+fn vimeo_search_url(query: &str) -> String {
+    query_url("https://vimeo.com/search", &[("q", query)])
+}
+
+fn google_search_url(query: &str) -> String {
+    query_url("https://www.google.com/search", &[("q", query)])
+}
+
+fn duckduckgo_search_url(query: &str) -> String {
+    query_url("https://duckduckgo.com/", &[("q", query)])
+}
+
+fn bing_search_url(query: &str) -> String {
+    query_url("https://www.bing.com/search", &[("q", query)])
+}
+
+fn yandex_search_url(query: &str) -> String {
+    query_url("https://yandex.ru/search/", &[("text", query)])
+}
+
+fn theaudiodb_artist_search_url(artist: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/search.php",
+        &[("s", artist)],
+    )
+}
+
+fn theaudiodb_track_search_url(artist: &str, title: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/searchtrack.php",
+        &[("s", artist), ("t", title)],
+    )
+}
+
+fn theaudiodb_album_search_url(artist: &str, album: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/searchalbum.php",
+        &[("s", artist), ("a", album)],
+    )
+}
+
+fn theaudiodb_track_mbid_url(recording_mbid: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/track-mb.php",
+        &[("i", recording_mbid)],
+    )
+}
+
+fn theaudiodb_artist_mbid_url(artist_mbid: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/artist-mb.php",
+        &[("i", artist_mbid)],
+    )
+}
+
+fn theaudiodb_album_mbid_url(release_group_mbid: &str) -> String {
+    query_url(
+        "https://www.theaudiodb.com/api/v1/json/2/album-mb.php",
+        &[("i", release_group_mbid)],
+    )
+}
+
+fn listenbrainz_recording_metadata_url(recording_mbid: &str) -> String {
+    query_url(
+        "https://api.listenbrainz.org/1/metadata/recording/",
+        &[
+            ("recording_mbids", recording_mbid),
+            ("inc", "artist release"),
+        ],
+    )
+}
+
+fn lastfm_artist_search_url(query: &str) -> String {
+    query_url("https://www.last.fm/search/artists", &[("q", query)])
+}
+
+fn lastfm_track_search_url(query: &str) -> String {
+    query_url("https://www.last.fm/search/tracks", &[("q", query)])
+}
+
+fn lastfm_album_search_url(query: &str) -> String {
+    query_url("https://www.last.fm/search/albums", &[("q", query)])
+}
+
 fn youtube_search_url(track: &LikedTrack) -> String {
     query_url(
         "https://www.youtube.com/results",
@@ -493,6 +1460,13 @@ fn query_url(base: &str, params: &[(&str, &str)]) -> String {
     format!("{base}?{query}")
 }
 
+fn path_search_url(base: &str, query: &str) -> String {
+    let query = form_urlencoded::byte_serialize(query.as_bytes())
+        .collect::<String>()
+        .replace('+', "%20");
+    format!("{base}/{query}")
+}
+
 #[derive(Debug, Deserialize)]
 struct MusicBrainzResponse {
     #[serde(default)]
@@ -505,6 +1479,59 @@ struct MusicBrainzRecording {
     #[serde(default, deserialize_with = "deserialize_i64_or_string")]
     score: i64,
     length: Option<u64>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct AcoustIdFingerprint {
+    duration_seconds: u64,
+    fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct FpcalcOutput {
+    duration: f64,
+    fingerprint: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdResponse {
+    status: String,
+    #[serde(default)]
+    results: Vec<AcoustIdResult>,
+    error: Option<AcoustIdError>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdError {
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdResult {
+    #[serde(default)]
+    score: f64,
+    #[serde(default)]
+    recordings: Vec<AcoustIdRecording>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdRecording {
+    id: String,
+    #[serde(default)]
+    artists: Vec<AcoustIdArtist>,
+    #[serde(default)]
+    releasegroups: Vec<AcoustIdReleaseGroup>,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdArtist {
+    id: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct AcoustIdReleaseGroup {
+    id: String,
 }
 
 fn deserialize_i64_or_string<'de, D>(deserializer: D) -> Result<i64, D::Error>
@@ -565,6 +1592,14 @@ mod tests {
         }
     }
 
+    fn no_enabled_services() -> HashSet<ExternalLinkService> {
+        HashSet::new()
+    }
+
+    fn no_disabled_services() -> HashSet<ExternalLinkService> {
+        HashSet::new()
+    }
+
     #[test]
     fn builds_encoded_external_search_urls() {
         let track = sample_track();
@@ -576,6 +1611,156 @@ mod tests {
         assert_eq!(
             lrclib_get_url(&track),
             "https://lrclib.net/api/get?track_name=Song+%26+Name&artist_name=Artist+Name&album_name=Album+Name&duration=123"
+        );
+        assert_eq!(
+            musicbrainz_entity_search_links(&track),
+            vec![
+                ExternalLink::new(
+                    "MusicBrainz artist search",
+                    "https://musicbrainz.org/search?query=Artist+Name&type=artist&method=indexed"
+                ),
+                ExternalLink::new(
+                    "MusicBrainz album search",
+                    "https://musicbrainz.org/search?query=Artist+Name+Album+Name&type=release_group&method=indexed"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn builds_related_music_service_search_links() {
+        let track = sample_track();
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
+
+        assert_eq!(
+            related_music_service_links(&track, &enabled_services, &disabled_services),
+            vec![
+                ExternalLink::new(
+                    "Spotify search",
+                    "https://open.spotify.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Apple Music search",
+                    "https://music.apple.com/search?term=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Deezer search",
+                    "https://www.deezer.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Bandcamp search",
+                    "https://bandcamp.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "SoundCloud search",
+                    "https://soundcloud.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Discogs search",
+                    "https://www.discogs.com/search/?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "TIDAL search",
+                    "https://tidal.com/search/Artist%20Name%20Song%20%26%20Name%20Album%20Name"
+                ),
+                ExternalLink::new(
+                    "Qobuz search",
+                    "https://play.qobuz.com/search/Artist%20Name%20Song%20%26%20Name%20Album%20Name"
+                ),
+                ExternalLink::new(
+                    "Amazon Music search",
+                    "https://music.amazon.com/search/Artist%20Name%20Song%20%26%20Name%20Album%20Name"
+                ),
+                ExternalLink::new(
+                    "YouTube Music search",
+                    "https://music.youtube.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Beatport search",
+                    "https://www.beatport.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "WhoSampled search",
+                    "https://www.whosampled.com/search/?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "SecondHandSongs search",
+                    "https://secondhandsongs.com/search?search_text=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "AllMusic search",
+                    "https://www.allmusic.com/search/all/Artist%20Name%20Song%20%26%20Name%20Album%20Name"
+                ),
+                ExternalLink::new(
+                    "ListenBrainz search",
+                    "https://listenbrainz.org/search/?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "VK Music search",
+                    "https://vk.com/search?c%5Bq%5D=Artist+Name+Song+%26+Name+Album+Name&c%5Bsection%5D=audio"
+                ),
+                ExternalLink::new(
+                    "Rutube search",
+                    "https://rutube.ru/search/?query=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Vimeo search",
+                    "https://vimeo.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Google search",
+                    "https://www.google.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "DuckDuckGo search",
+                    "https://duckduckgo.com/?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Bing search",
+                    "https://www.bing.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex search",
+                    "https://yandex.ru/search/?text=Artist+Name+Song+%26+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm artist search",
+                    "https://www.last.fm/search/artists?q=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm track search",
+                    "https://www.last.fm/search/tracks?q=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm album search",
+                    "https://www.last.fm/search/albums?q=Artist+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB artist search",
+                    "https://www.theaudiodb.com/api/v1/json/2/search.php?s=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB track search",
+                    "https://www.theaudiodb.com/api/v1/json/2/searchtrack.php?s=Artist+Name&t=Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB album search",
+                    "https://www.theaudiodb.com/api/v1/json/2/searchalbum.php?s=Artist+Name&a=Album+Name"
+                ),
+                ExternalLink::new(
+                    "RuTracker artist search",
+                    "https://rutracker.org/forum/tracker.php?nm=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "RuTracker track search",
+                    "https://rutracker.org/forum/tracker.php?nm=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "RuTracker album search",
+                    "https://rutracker.org/forum/tracker.php?nm=Artist+Name+Album+Name"
+                ),
+            ]
         );
     }
 
@@ -619,11 +1804,188 @@ mod tests {
     }
 
     #[test]
+    fn extracts_musicbrainz_links_from_acoustid_response() {
+        let response = serde_json::from_str::<AcoustIdResponse>(
+            r#"{
+                "status": "ok",
+                "results": [
+                    {
+                        "score": 0.7,
+                        "recordings": [{"id": "weak-recording"}]
+                    },
+                    {
+                        "score": 0.98,
+                        "recordings": [{
+                            "id": "recording-id",
+                            "artists": [{"id": "artist-id", "name": "Artist Name"}],
+                            "releasegroups": [{"id": "album-id", "title": "Album Name"}]
+                        }]
+                    }
+                ]
+            }"#,
+        )
+        .expect("deserialize AcoustID response");
+
+        let recording = best_acoustid_recording(response).expect("recording match");
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
+
+        assert_eq!(
+            musicbrainz_links_from_acoustid_recording(
+                &recording,
+                &enabled_services,
+                &disabled_services,
+            ),
+            vec![
+                ExternalLink::new(
+                    "MusicBrainz recording",
+                    "https://musicbrainz.org/recording/recording-id"
+                ),
+                ExternalLink::new(
+                    "ListenBrainz recording metadata",
+                    "https://api.listenbrainz.org/1/metadata/recording/?recording_mbids=recording-id&inc=artist+release"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB track MBID lookup",
+                    "https://www.theaudiodb.com/api/v1/json/2/track-mb.php?i=recording-id"
+                ),
+                ExternalLink::new(
+                    "MusicBrainz artist",
+                    "https://musicbrainz.org/artist/artist-id"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB artist MBID lookup",
+                    "https://www.theaudiodb.com/api/v1/json/2/artist-mb.php?i=artist-id"
+                ),
+                ExternalLink::new(
+                    "MusicBrainz album",
+                    "https://musicbrainz.org/release-group/album-id"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB album MBID lookup",
+                    "https://www.theaudiodb.com/api/v1/json/2/album-mb.php?i=album-id"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_weak_acoustid_matches() {
+        let response = serde_json::from_str::<AcoustIdResponse>(
+            r#"{
+                "status": "ok",
+                "results": [{
+                    "score": 0.79,
+                    "recordings": [{"id": "recording-id"}]
+                }]
+            }"#,
+        )
+        .expect("deserialize AcoustID response");
+
+        assert!(best_acoustid_recording(response).is_none());
+    }
+
+    #[test]
+    fn adds_musicbrainz_search_links_missing_after_acoustid_match() {
+        let track = sample_track();
+        let mut links = vec![ExternalLink::new(
+            "MusicBrainz recording",
+            "https://musicbrainz.org/recording/recording-id",
+        )];
+
+        add_missing_musicbrainz_search_links(&mut links, &track);
+
+        assert_eq!(
+            links,
+            vec![
+                ExternalLink::new(
+                    "MusicBrainz recording",
+                    "https://musicbrainz.org/recording/recording-id"
+                ),
+                ExternalLink::new(
+                    "MusicBrainz artist search",
+                    "https://musicbrainz.org/search?query=Artist+Name&type=artist&method=indexed"
+                ),
+                ExternalLink::new(
+                    "MusicBrainz album search",
+                    "https://musicbrainz.org/search?query=Artist+Name+Album+Name&type=release_group&method=indexed"
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn preserves_exact_acoustid_musicbrainz_entities() {
+        let track = sample_track();
+        let mut links = vec![
+            ExternalLink::new(
+                "MusicBrainz artist",
+                "https://musicbrainz.org/artist/artist-id",
+            ),
+            ExternalLink::new(
+                "MusicBrainz album",
+                "https://musicbrainz.org/release-group/album-id",
+            ),
+        ];
+
+        add_missing_musicbrainz_search_links(&mut links, &track);
+
+        assert_eq!(links.len(), 2);
+    }
+
+    #[test]
+    fn parses_external_link_service_aliases() {
+        let services = parse_external_link_services(vec![
+            "Last.FM".to_string(),
+            "youtube-music".to_string(),
+            "ddg".to_string(),
+            "odesli".to_string(),
+            "rutracker".to_string(),
+        ])
+        .expect("parse services");
+
+        assert!(services.contains(&ExternalLinkService::LastFm));
+        assert!(services.contains(&ExternalLinkService::YouTubeMusic));
+        assert!(services.contains(&ExternalLinkService::DuckDuckGo));
+        assert!(services.contains(&ExternalLinkService::Songlink));
+        assert!(services.contains(&ExternalLinkService::RuTracker));
+    }
+
+    #[test]
+    fn rejects_unknown_external_link_service() {
+        let error =
+            parse_external_link_services(vec!["unknown".to_string()]).expect_err("invalid service");
+
+        assert!(error.to_string().contains("unknown external link service"));
+        assert!(error.to_string().contains("spotify"));
+    }
+
+    #[test]
+    fn filters_related_links_with_whitelist_and_blocklist() {
+        let track = sample_track();
+        let enabled_services =
+            parse_external_link_services(vec!["spotify".to_string(), "google".to_string()])
+                .expect("enabled services");
+        let disabled_services =
+            parse_external_link_services(vec!["google".to_string()]).expect("disabled services");
+
+        assert_eq!(
+            related_music_service_links(&track, &enabled_services, &disabled_services),
+            vec![ExternalLink::new(
+                "Spotify search",
+                "https://open.spotify.com/search?q=Artist+Name+Song+%26+Name+Album+Name"
+            )]
+        );
+    }
+
+    #[test]
     fn builds_fallback_links_without_artist_or_album() {
         let mut track = sample_track();
         track.artists.clear();
         track.albums.clear();
         track.duration_ms = None;
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
 
         assert_eq!(musicbrainz_query(&track), "recording:\"Song & Name\"");
         assert_eq!(human_query(&track), "Song & Name");
@@ -632,22 +1994,46 @@ mod tests {
             "https://lrclib.net/api/get?track_name=Song+%26+Name&artist_name=&album_name="
         );
         assert_eq!(
-            wikimedia_links(&track),
+            wikimedia_links(&track, &enabled_services, &disabled_services),
             vec![ExternalLink::new(
                 "Wikidata track search",
                 "https://www.wikidata.org/w/index.php?search=Song+%26+Name"
             )]
+        );
+        assert_eq!(musicbrainz_entity_search_links(&track), Vec::new());
+        assert_eq!(
+            related_music_service_links(&track, &enabled_services, &disabled_services)
+                .first()
+                .expect("spotify link"),
+            &ExternalLink::new(
+                "Spotify search",
+                "https://open.spotify.com/search?q=Song+%26+Name"
+            )
+        );
+        assert!(
+            related_music_service_links(&track, &enabled_services, &disabled_services).contains(
+                &ExternalLink::new(
+                    "Last.fm track search",
+                    "https://www.last.fm/search/tracks?q=Song+%26+Name"
+                )
+            )
         );
     }
 
     #[test]
     fn builds_wikidata_track_search_with_artist_context() {
         let track = sample_track();
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
 
-        assert!(wikimedia_links(&track).contains(&ExternalLink::new(
-            "Wikidata track search",
-            "https://www.wikidata.org/w/index.php?search=Artist+Name+Song+%26+Name"
-        )));
+        assert!(
+            wikimedia_links(&track, &enabled_services, &disabled_services).contains(
+                &ExternalLink::new(
+                    "Wikidata track search",
+                    "https://www.wikidata.org/w/index.php?search=Artist+Name+Song+%26+Name"
+                )
+            )
+        );
     }
 
     #[test]
