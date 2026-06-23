@@ -937,6 +937,107 @@ mod tests {
     }
 
     #[test]
+    fn create_track_note_fails_after_exhausting_transient_retries() {
+        let http = MockHttpClient::default();
+        http.push_error("first transport error");
+        http.push_response(find_notes_metadata_response(Vec::new()));
+        http.push_error("second transport error");
+        http.push_response(find_notes_metadata_response(Vec::new()));
+        http.push_error("third transport error");
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+
+        let error = client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
+                None,
+            )
+            .expect_err("retry exhaustion should fail");
+
+        assert_eq!(error.to_string(), "Evernote API error: transport error");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "findNotesMetadata".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "findNotesMetadata".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+            ]
+        );
+        assert_eq!(http.create_requests().len(), 3);
+    }
+
+    #[test]
+    fn create_track_note_retries_when_existing_note_lookup_fails() {
+        let http = MockHttpClient::default();
+        http.push_error("temporary transport error");
+        http.push_error("temporary findNotesMetadata error");
+        http.push_response(create_note_response("note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+
+        let guid = client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
+                None,
+            )
+            .expect("retry should succeed");
+
+        assert_eq!(guid, "note-guid");
+        assert_eq!(
+            http.calls(),
+            vec![
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "findNotesMetadata".to_string()
+                },
+                MockCall {
+                    url: NOTE_STORE_URL.to_string(),
+                    method: "createNote".to_string()
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn create_track_note_uses_existing_note_found_after_transport_error() {
         let http = MockHttpClient::default();
         http.push_error("temporary transport error after create");
@@ -977,6 +1078,14 @@ mod tests {
             ]
         );
         assert_eq!(http.create_requests().len(), 1);
+    }
+
+    #[test]
+    fn source_url_search_query_escapes_evernote_phrase_characters() {
+        assert_eq!(
+            source_url_search_query(r#"https://example.test/a"b\c"#),
+            r#"sourceURL:"https://example.test/a\"b\\c""#
+        );
     }
 
     #[test]

@@ -1898,6 +1898,53 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn applies_whitelist_and_blocklist_to_newer_external_services() {
+        let track = sample_track();
+        let client = EnrichmentClient::new(
+            None,
+            "US",
+            None,
+            vec![
+                "last.fm".to_string(),
+                "rutracker".to_string(),
+                "yandex-video".to_string(),
+            ],
+            vec!["rutracker".to_string()],
+        )
+        .expect("client");
+
+        assert_eq!(
+            client.links_for(&track, None).await,
+            vec![
+                ExternalLink::new(
+                    "Last.fm artist search",
+                    "https://www.last.fm/search/artists?q=Artist+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm track search",
+                    "https://www.last.fm/search/tracks?q=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Last.fm album search",
+                    "https://www.last.fm/search/albums?q=Artist+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video track search",
+                    "https://yandex.ru/video/search?text=Artist+Name+Song+%26+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video album search",
+                    "https://yandex.ru/video/search?text=Artist+Name+Album+Name"
+                ),
+                ExternalLink::new(
+                    "Yandex Video artist search",
+                    "https://yandex.ru/video/search?text=Artist+Name"
+                ),
+            ]
+        );
+    }
+
     #[test]
     fn filters_weak_musicbrainz_matches() {
         let track = sample_track();

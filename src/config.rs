@@ -173,6 +173,17 @@ mod tests {
     }
 
     #[test]
+    fn defaults_match_documented_sync_behavior() {
+        let settings = base_settings().validate().expect("valid settings");
+
+        assert_eq!(DEFAULT_MAX_TRACKS_PER_RUN, 30);
+        assert_eq!(settings.max_tracks_per_run, DEFAULT_MAX_TRACKS_PER_RUN);
+        assert!(settings.backup_audio);
+        assert!(settings.enrich_external_links);
+        assert_eq!(settings.evernote_tags, DEFAULT_EVERNOTE_TAG);
+    }
+
+    #[test]
     fn empty_note_store_url_is_treated_as_missing() {
         let mut settings = base_settings();
         settings.evernote_note_store_url = Some("  ".to_string());
@@ -271,6 +282,25 @@ mod tests {
             vec!["genius", "vk"]
         );
         assert_eq!(settings.songlink_user_country, "GE");
+    }
+
+    #[test]
+    fn normalizes_external_service_lists_without_empty_items() {
+        let mut settings = base_settings();
+        settings.enabled_external_link_services =
+            " Yandex-Video, Last.FM, RuTracker, YouTube-Music,, ".to_string();
+        settings.disabled_external_link_services = " RuTracker, VK, ".to_string();
+
+        let settings = settings.validate().expect("valid settings");
+
+        assert_eq!(
+            settings.enabled_external_link_service_names(),
+            vec!["yandex-video", "last.fm", "rutracker", "youtube-music"]
+        );
+        assert_eq!(
+            settings.disabled_external_link_service_names(),
+            vec!["rutracker", "vk"]
+        );
     }
 
     #[test]
