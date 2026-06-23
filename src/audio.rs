@@ -33,6 +33,63 @@ pub struct AudioAttachment {
     md5: [u8; 16],
 }
 
+/// Downloaded cover image ready to be embedded as an Evernote resource.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CoverImage {
+    pub bytes: Vec<u8>,
+    pub mime: String,
+}
+
+impl CoverImage {
+    /// Build a cover image only when the HTTP content type or file signature is
+    /// an image format Evernote can render inline.
+    pub fn new(bytes: Vec<u8>, content_type: Option<&str>) -> Option<Self> {
+        if bytes.is_empty() {
+            return None;
+        }
+        let mime = image_mime(&bytes, content_type)?;
+        Some(Self {
+            bytes,
+            mime: mime.to_string(),
+        })
+    }
+}
+
+/// Cover image prepared for attaching to an Evernote note as inline media.
+pub struct CoverAttachment {
+    pub body: Vec<u8>,
+    pub mime: String,
+    pub file_name: String,
+    md5: [u8; 16],
+}
+
+impl CoverAttachment {
+    pub fn new(image: CoverImage) -> Self {
+        let file_name = format!("cover.{}", image_extension(&image.mime));
+        let md5 = md5::compute(&image.bytes).0;
+        Self {
+            body: image.bytes,
+            mime: image.mime,
+            file_name,
+            md5,
+        }
+    }
+
+    /// Raw MD5 digest, as Evernote expects in `Data.bodyHash`.
+    pub fn md5_raw(&self) -> Vec<u8> {
+        self.md5.to_vec()
+    }
+
+    /// Hex-encoded MD5 digest, as Evernote expects in the `<en-media hash="...">` attribute.
+    pub fn md5_hex(&self) -> String {
+        hex_md5(self.md5)
+    }
+
+    pub fn size(&self) -> usize {
+        self.body.len()
+    }
+}
+
 impl AudioAttachment {
     /// Prepare downloaded audio for a note, naming the file after the note title
     /// and computing the MD5 that Evernote uses to link the resource.
@@ -57,17 +114,14 @@ impl AudioAttachment {
 
     /// Hex-encoded MD5 digest, as Evernote expects in the `<en-media hash="...">` attribute.
     pub fn md5_hex(&self) -> String {
-        let mut hex = String::with_capacity(self.md5.len() * 2);
-        for byte in self.md5 {
-            let _ = write!(hex, "{byte:02x}");
-        }
-        hex
+        hex_md5(self.md5)
     }
 
     pub fn size(&self) -> usize {
         self.body.len()
     }
 
+    #[cfg(test)]
     pub fn human_size(&self) -> String {
         human_size(self.body.len())
     }
@@ -93,6 +147,14 @@ impl AudioAttachment {
     }
 }
 
+fn hex_md5(md5: [u8; 16]) -> String {
+    let mut hex = String::with_capacity(md5.len() * 2);
+    for byte in md5 {
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
 fn codec_extension(codec: &str) -> &'static str {
     match codec {
         "flac" => "flac",
@@ -110,6 +172,47 @@ fn codec_mime(codec: &str) -> &'static str {
         "mp3" => "audio/mpeg",
         "aac" | "aac-mp4" | "he-aac" | "he-aac-mp4" => "audio/mp4",
         _ => "application/octet-stream",
+    }
+}
+
+fn image_mime(bytes: &[u8], content_type: Option<&str>) -> Option<&'static str> {
+    content_type
+        .and_then(|content_type| normalized_image_mime(content_type.split(';').next()?.trim()))
+        .or_else(|| image_mime_from_magic(bytes))
+}
+
+fn normalized_image_mime(content_type: &str) -> Option<&'static str> {
+    if content_type.eq_ignore_ascii_case("image/jpeg")
+        || content_type.eq_ignore_ascii_case("image/jpg")
+    {
+        Some("image/jpeg")
+    } else if content_type.eq_ignore_ascii_case("image/png") {
+        Some("image/png")
+    } else if content_type.eq_ignore_ascii_case("image/gif") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn image_mime_from_magic(bytes: &[u8]) -> Option<&'static str> {
+    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
+        Some("image/jpeg")
+    } else if bytes.starts_with(b"\x89PNG\r\n\x1a\n") {
+        Some("image/png")
+    } else if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
+        Some("image/gif")
+    } else {
+        None
+    }
+}
+
+fn image_extension(mime: &str) -> &'static str {
+    match mime {
+        "image/jpeg" => "jpg",
+        "image/png" => "png",
+        "image/gif" => "gif",
+        _ => "img",
     }
 }
 
@@ -139,6 +242,7 @@ fn sanitize_file_stem(name: &str) -> String {
         .to_string()
 }
 
+#[cfg(test)]
 fn human_size(bytes: usize) -> String {
     const KIB: f64 = 1024.0;
     const MIB: f64 = 1024.0 * 1024.0;
@@ -214,5 +318,49 @@ mod tests {
         assert_eq!(human_size(512), "512 B");
         assert_eq!(human_size(2048), "2.0 KiB");
         assert_eq!(human_size(3 * 1024 * 1024), "3.0 MiB");
+    }
+
+    #[test]
+    fn prepares_cover_attachment_from_supported_image_type() {
+        let image = CoverImage::new(
+            b"not really a jpeg".to_vec(),
+            Some("image/jpeg; charset=utf-8"),
+        )
+        .expect("jpeg content type should be supported");
+        let attachment = CoverAttachment::new(image);
+
+        assert_eq!(attachment.mime, "image/jpeg");
+        assert_eq!(attachment.file_name, "cover.jpg");
+        assert_eq!(attachment.size(), 17);
+        assert_eq!(attachment.md5_raw().len(), 16);
+    }
+
+    #[test]
+    fn detects_cover_image_type_from_magic_bytes() {
+        assert_eq!(
+            CoverImage::new(vec![0xff, 0xd8, 0xff], None)
+                .expect("jpeg magic")
+                .mime,
+            "image/jpeg"
+        );
+        assert_eq!(
+            CoverImage::new(b"\x89PNG\r\n\x1a\n".to_vec(), None)
+                .expect("png magic")
+                .mime,
+            "image/png"
+        );
+        assert_eq!(
+            CoverImage::new(b"GIF89a".to_vec(), None)
+                .expect("gif magic")
+                .mime,
+            "image/gif"
+        );
+    }
+
+    #[test]
+    fn rejects_unsupported_cover_image_type() {
+        assert!(CoverImage::new(Vec::new(), Some("image/jpeg")).is_none());
+        assert!(CoverImage::new(b"webp".to_vec(), Some("image/webp")).is_none());
+        assert!(CoverImage::new(b"text".to_vec(), Some("text/plain")).is_none());
     }
 }

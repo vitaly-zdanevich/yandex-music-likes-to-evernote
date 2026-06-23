@@ -1,6 +1,6 @@
 use html_escape::encode_safe;
 
-use crate::audio::AudioAttachment;
+use crate::audio::{AudioAttachment, CoverAttachment};
 use crate::enrichment::ExternalLink;
 use crate::yandex::LikedTrack;
 
@@ -16,29 +16,20 @@ pub fn title(track: &LikedTrack) -> String {
 pub fn enml(
     track: &LikedTrack,
     external_links: &[ExternalLink],
+    cover: Option<&CoverAttachment>,
     audio: Option<&AudioAttachment>,
 ) -> String {
-    let album_list = display_list(&track.albums);
     let liked_at_rfc3339 = track.liked_at.to_rfc3339();
-    let track_id = encode_safe(&track.id);
     let title = encode_safe(&track.title);
     let artists = render_artists(track);
-    let albums = encode_safe(&album_list);
+    let albums = render_albums(track);
     let liked_at = encode_safe(&liked_at_rfc3339);
-    let url = encode_safe(&track.yandex_url);
     let duration = track
         .duration_ms
         .map(format_duration)
         .map(|duration| format!("<div><b>Duration:</b> {}</div>", encode_safe(&duration)))
         .unwrap_or_default();
-    let cover = track
-        .cover_url
-        .as_deref()
-        .map(|cover_url| {
-            let cover_url = encode_safe(cover_url);
-            format!("<div><b>Cover:</b> <a href=\"{cover_url}\">{cover_url}</a></div>")
-        })
-        .unwrap_or_default();
+    let cover = cover.map(render_cover).unwrap_or_default();
     let external_links = render_external_links(external_links);
     let audio = audio
         .map(|audio| render_audio(audio, track.duration_ms))
@@ -48,13 +39,11 @@ pub fn enml(
         r#"<?xml version="1.0" encoding="UTF-8"?>
 <!DOCTYPE en-note SYSTEM "http://xml.evernote.com/pub/enml2.dtd">
 <en-note>
-<div><b>Track ID:</b> {track_id}</div>
 <div><b>Track:</b> {title}</div>
-<div><b>Artist:</b> {artists}</div>
 <div><b>Album:</b> {albums}</div>
+<div><b>Artist:</b> {artists}</div>
 {duration}
 <div><b>Liked at:</b> {liked_at}</div>
-<div><b>Yandex Music:</b> <a href="{url}">{url}</a></div>
 {cover}
 {audio}
 {external_links}
@@ -63,8 +52,6 @@ pub fn enml(
 }
 
 fn render_audio(audio: &AudioAttachment, duration_ms: Option<u128>) -> String {
-    let human_size = audio.human_size();
-    let file_name = encode_safe(&audio.file_name);
     let mime = encode_safe(&audio.mime);
     let hash = audio.md5_hex();
 
@@ -75,12 +62,16 @@ fn render_audio(audio: &AudioAttachment, duration_ms: Option<u128>) -> String {
         let prefix = if estimated { "~" } else { "" };
         details.push(format!("{prefix}{kbps} kbps"));
     }
-    details.push(encode_safe(&human_size).into_owned());
     let details = details.join(", ");
 
-    format!(
-        "<div><b>Audio:</b> {file_name} ({details})</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>"
-    )
+    format!("<div><b>Audio:</b> {details}</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>")
+}
+
+fn render_cover(cover: &CoverAttachment) -> String {
+    let mime = encode_safe(&cover.mime);
+    let hash = cover.md5_hex();
+
+    format!("<en-media type=\"{mime}\" hash=\"{hash}\"/>")
 }
 
 fn display_list(items: &[String]) -> String {
@@ -115,6 +106,27 @@ fn render_artists(track: &LikedTrack) -> String {
         .join(", ")
 }
 
+fn render_albums(track: &LikedTrack) -> String {
+    if track.album_links.is_empty() {
+        return encode_safe(&display_list(&track.albums)).into_owned();
+    }
+
+    track
+        .albums
+        .iter()
+        .map(|album| {
+            if let Some(link) = track.album_links.iter().find(|link| link.name == *album) {
+                let name = encode_safe(album);
+                let url = encode_safe(&link.yandex_url);
+                format!("<a href=\"{url}\">{name}</a>")
+            } else {
+                encode_safe(album).into_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 fn render_external_links(links: &[ExternalLink]) -> String {
     if links.is_empty() {
         return String::new();
@@ -130,7 +142,7 @@ fn render_external_links(links: &[ExternalLink]) -> String {
         .collect::<Vec<_>>()
         .join("\n");
 
-    format!("<div><br/></div>\n<div><b>External links:</b></div>\n{rows}")
+    format!("<div><br/></div>\n{rows}")
 }
 
 #[cfg(test)]
@@ -138,8 +150,8 @@ mod tests {
     use chrono::TimeZone;
 
     use super::*;
-    use crate::audio::TrackAudio;
-    use crate::yandex::ArtistLink;
+    use crate::audio::{CoverImage, TrackAudio};
+    use crate::yandex::{AlbumLink, ArtistLink};
 
     #[test]
     fn renders_enml_with_escaped_values() {
@@ -153,6 +165,10 @@ mod tests {
                 yandex_url: "https://music.yandex.com/artist/42".to_string(),
             }],
             albums: vec!["Album".to_string()],
+            album_links: vec![AlbumLink {
+                name: "Album".to_string(),
+                yandex_url: "https://music.yandex.com/album/43".to_string(),
+            }],
             duration_ms: Some(123_000),
             cover_url: Some("https://example.com/a?b=1&c=2".to_string()),
             yandex_url: "https://music.yandex.com/track/1".to_string(),
@@ -162,18 +178,32 @@ mod tests {
             label: "MusicBrainz recording search".to_string(),
             url: "https://musicbrainz.org/search?query=a&b=c".to_string(),
         }];
-        let enml = enml(&track, &links, None);
+        let cover = CoverAttachment::new(
+            CoverImage::new(b"cover".to_vec(), Some("image/jpeg")).expect("cover image"),
+        );
+        let enml = enml(&track, &links, Some(&cover), None);
 
         assert!(enml.contains("A &lt; B"));
-        assert!(!enml.contains("<en-media"));
-        assert!(enml.contains("<div><b>Track ID:</b> 1</div>"));
+        assert!(!enml.contains("<b>Track ID:</b>"));
         assert!(enml.contains(
             r#"<div><b>Artist:</b> <a href="https:&#x2F;&#x2F;music.yandex.com&#x2F;artist&#x2F;42">Artist &amp; Co</a></div>"#
         ));
+        assert!(enml.contains(
+            r#"<div><b>Album:</b> <a href="https:&#x2F;&#x2F;music.yandex.com&#x2F;album&#x2F;43">Album</a></div>"#
+        ));
+        let track_index = enml.find("<b>Track:</b>").expect("track line");
+        let album_index = enml.find("<b>Album:</b>").expect("album line");
+        let artist_index = enml.find("<b>Artist:</b>").expect("artist line");
+        assert!(track_index < album_index);
+        assert!(album_index < artist_index);
+        assert!(!enml.contains("<b>Cover:</b>"));
+        assert!(enml.contains(r#"<en-media type="image&#x2F;jpeg""#));
+        assert!(!enml.contains(r#"<a href="https:&#x2F;&#x2F;example.com&#x2F;a?b=1&amp;c=2""#));
         assert!(enml.contains("2:03"));
-        assert!(enml.contains("External links"));
+        assert!(!enml.contains("External links"));
         assert!(enml.contains("MusicBrainz recording search"));
         assert!(enml.contains("musicbrainz.org"));
+        assert!(!enml.contains("<b>Yandex Music:</b>"));
         assert!(!enml.contains("Audio is not copied by this tool"));
     }
 
@@ -186,12 +216,13 @@ mod tests {
             artists: Vec::new(),
             artist_links: Vec::new(),
             albums: Vec::new(),
+            album_links: Vec::new(),
             duration_ms: None,
             cover_url: None,
             yandex_url: "https://music.yandex.com/track/2".to_string(),
         };
 
-        let enml = enml(&track, &[], None);
+        let enml = enml(&track, &[], None, None);
 
         assert_eq!(title(&track), "Solo Track");
         assert!(enml.contains("<div><b>Track:</b> Solo Track</div>"));
@@ -211,6 +242,7 @@ mod tests {
             artists: vec!["Artist".to_string()],
             artist_links: Vec::new(),
             albums: Vec::new(),
+            album_links: Vec::new(),
             duration_ms: None,
             cover_url: None,
             yandex_url: "https://music.yandex.com/track/3".to_string(),
@@ -225,9 +257,11 @@ mod tests {
             &title(&track),
         );
 
-        let enml = enml(&track, &[], Some(&audio));
+        let enml = enml(&track, &[], None, Some(&audio));
 
-        assert!(enml.contains("<b>Audio:</b> Artist - Song.flac (lossless, 1411 kbps, 5 B)"));
+        assert!(enml.contains("<b>Audio:</b> lossless, 1411 kbps</div>"));
+        assert!(!enml.contains("Artist - Song.flac"));
+        assert!(!enml.contains("5 B"));
         assert!(enml.contains(
             r#"<en-media type="audio&#x2F;flac" hash="5d41402abc4b2a76b9719d911017c592"/>"#
         ));
@@ -242,6 +276,7 @@ mod tests {
             artists: vec!["Jean-Michel Jarre".to_string()],
             artist_links: Vec::new(),
             albums: Vec::new(),
+            album_links: Vec::new(),
             duration_ms: None,
             cover_url: None,
             yandex_url: "https://music.yandex.com/track/4".to_string(),
@@ -256,9 +291,11 @@ mod tests {
             &title(&track),
         );
 
-        let enml = enml(&track, &[], Some(&audio));
+        let enml = enml(&track, &[], None, Some(&audio));
 
-        assert!(enml.contains("<b>Audio:</b> Jean-Michel Jarre - Ethnicolor.mp4 (lossless, 3 B)"));
+        assert!(enml.contains("<b>Audio:</b> lossless</div>"));
+        assert!(!enml.contains("Jean-Michel Jarre - Ethnicolor.mp4"));
+        assert!(!enml.contains("3 B"));
         assert!(!enml.contains("kbps"));
         assert!(enml.contains(r#"<en-media type="audio&#x2F;mp4""#));
     }
@@ -272,6 +309,7 @@ mod tests {
             artists: vec!["Jean-Michel Jarre".to_string()],
             artist_links: Vec::new(),
             albums: Vec::new(),
+            album_links: Vec::new(),
             duration_ms: Some(1_000),
             cover_url: None,
             yandex_url: "https://music.yandex.com/track/5".to_string(),
@@ -287,8 +325,11 @@ mod tests {
             &title(&track),
         );
 
-        let enml = enml(&track, &[], Some(&audio));
+        let enml = enml(&track, &[], None, Some(&audio));
 
-        assert!(enml.contains("(lossless, ~800 kbps,"), "got: {enml}");
+        assert!(
+            enml.contains("<b>Audio:</b> lossless, ~800 kbps</div>"),
+            "got: {enml}"
+        );
     }
 }

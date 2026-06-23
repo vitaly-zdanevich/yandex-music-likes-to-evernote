@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use anyhow::{Context, Result, anyhow};
 use chrono::{DateTime, Utc};
+use reqwest::header::CONTENT_TYPE;
 use serde::{Deserialize, Deserializer};
 use serde_json::Value;
 use tracing::warn;
@@ -12,7 +13,7 @@ use yandex_music::{
     model::info::file_info::Quality,
 };
 
-use crate::audio::TrackAudio;
+use crate::audio::{CoverImage, TrackAudio};
 
 const AUDIO_DOWNLOAD_USER_AGENT: &str =
     concat!("yandex-music-likes-to-evernote/", env!("CARGO_PKG_VERSION"));
@@ -30,6 +31,7 @@ pub struct LikedTrack {
     pub artists: Vec<String>,
     pub artist_links: Vec<ArtistLink>,
     pub albums: Vec<String>,
+    pub album_links: Vec<AlbumLink>,
     pub duration_ms: Option<u128>,
     pub cover_url: Option<String>,
     pub yandex_url: String,
@@ -37,6 +39,12 @@ pub struct LikedTrack {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ArtistLink {
+    pub name: String,
+    pub yandex_url: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AlbumLink {
     pub name: String,
     pub yandex_url: String,
 }
@@ -203,6 +211,38 @@ impl YandexClient {
         Ok(None)
     }
 
+    /// Download a cover image so Evernote can embed it as an inline resource
+    /// instead of storing only an external image link.
+    pub async fn download_cover(&self, cover_url: &str) -> Result<Option<CoverImage>> {
+        let response = self
+            .download_http
+            .get(cover_url)
+            .send()
+            .await
+            .context("failed to request cover image")?
+            .error_for_status()
+            .context("cover image host returned an HTTP error")?;
+        let content_type = response
+            .headers()
+            .get(CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(ToOwned::to_owned);
+        let bytes = response
+            .bytes()
+            .await
+            .context("failed to read cover image body")?
+            .to_vec();
+
+        let image = CoverImage::new(bytes, content_type.as_deref());
+        if image.is_none() {
+            warn!(
+                cover_url,
+                content_type, "cover image has an unsupported image type"
+            );
+        }
+        Ok(image)
+    }
+
     async fn download_file(&self, url: &str) -> Result<Vec<u8>> {
         let bytes = self
             .download_http
@@ -261,6 +301,8 @@ struct RawArtist {
 
 #[derive(Debug, Deserialize)]
 struct RawAlbum {
+    #[serde(default, deserialize_with = "optional_number_or_string_to_string")]
+    id: Option<String>,
     title: Option<String>,
 }
 
@@ -268,6 +310,7 @@ fn to_liked_track(track: RawTrack, liked_at: DateTime<Utc>) -> LikedTrack {
     let artists = track.artists.iter().filter_map(artist_name).collect();
     let artist_links = track.artists.iter().filter_map(artist_link).collect();
     let albums = track.albums.iter().filter_map(album_title).collect();
+    let album_links = track.albums.iter().filter_map(album_link).collect();
     let cover_url = track
         .cover_uri
         .or_else(|| track.og_image.clone())
@@ -283,6 +326,7 @@ fn to_liked_track(track: RawTrack, liked_at: DateTime<Utc>) -> LikedTrack {
         artists,
         artist_links,
         albums,
+        album_links,
         duration_ms,
         cover_url,
         yandex_url,
@@ -319,6 +363,20 @@ fn album_title(album: &RawAlbum) -> Option<String> {
         .map(str::trim)
         .filter(|title| !title.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn album_link(album: &RawAlbum) -> Option<AlbumLink> {
+    let name = album_title(album)?;
+    let id = album
+        .id
+        .as_deref()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())?;
+
+    Some(AlbumLink {
+        name,
+        yandex_url: format!("https://music.yandex.com/album/{id}"),
+    })
 }
 
 fn normalize_cover_url(uri: String) -> String {
@@ -397,7 +455,7 @@ mod tests {
                 "id": 123,
                 "title": "Track Title",
                 "artists": [{"id": 456, "name": "Artist"}],
-                "albums": [{"title": "Album"}],
+                "albums": [{"id": 789, "title": "Album"}],
                 "coverUri": "avatars.yandex.net/get-music-content/1/abc%%",
                 "durationMs": 123000,
                 "metaData": {
@@ -423,6 +481,13 @@ mod tests {
             }]
         );
         assert_eq!(track.albums, vec!["Album"]);
+        assert_eq!(
+            track.album_links,
+            vec![AlbumLink {
+                name: "Album".to_string(),
+                yandex_url: "https://music.yandex.com/album/789".to_string(),
+            }]
+        );
         assert_eq!(track.duration_ms, Some(123000));
     }
 
@@ -433,7 +498,7 @@ mod tests {
                 "id": "track-id",
                 "title": null,
                 "artists": [{"id": 123, "name": "  "}, {"id": "artist-id", "name": "Artist"}],
-                "albums": [{"title": ""}, {"title": "Album"}],
+                "albums": [{"title": ""}, {"id": "album-id", "title": "Album"}],
                 "ogImage": "https://example.test/cover.jpg",
                 "durationMs": "45000"
             }"#,
@@ -456,6 +521,13 @@ mod tests {
             }]
         );
         assert_eq!(track.albums, vec!["Album"]);
+        assert_eq!(
+            track.album_links,
+            vec![AlbumLink {
+                name: "Album".to_string(),
+                yandex_url: "https://music.yandex.com/album/album-id".to_string(),
+            }]
+        );
         assert_eq!(
             track.cover_url.as_deref(),
             Some("https://example.test/cover.jpg")

@@ -1586,6 +1586,7 @@ mod tests {
             artists: vec!["Artist Name".to_string()],
             artist_links: Vec::new(),
             albums: vec!["Album Name".to_string()],
+            album_links: Vec::new(),
             duration_ms: Some(123_000),
             cover_url: None,
             yandex_url: "https://music.yandex.com/track/123".to_string(),

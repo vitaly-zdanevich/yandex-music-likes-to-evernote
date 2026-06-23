@@ -7,7 +7,7 @@ use evernote::note_store::{NoteStoreSyncClient, TNoteStoreSyncClient};
 use evernote::types::{self, Data, NoteAttributes, Resource, ResourceAttributes};
 use evernote::user_store::{TUserStoreSyncClient, UserStoreSyncClient};
 
-use crate::audio::AudioAttachment;
+use crate::audio::{AudioAttachment, CoverAttachment};
 use reqwest::blocking::Client as ReqwestClient;
 use thrift::protocol::{TBinaryInputProtocol, TBinaryOutputProtocol};
 use thrift::transport::{ReadHalf, TIoChannel, WriteHalf};
@@ -120,6 +120,8 @@ where
         &self,
         title: String,
         content: String,
+        source_url: String,
+        cover: Option<&CoverAttachment>,
         audio: Option<&AudioAttachment>,
     ) -> Result<String> {
         let notebook_guid = self.notebook_guid()?;
@@ -130,11 +132,12 @@ where
             notebook_guid,
             attributes: Some(NoteAttributes {
                 source: Some("yandex-music-likes-to-evernote".to_string()),
+                source_u_r_l: Some(source_url),
                 source_application: Some(CLIENT_NAME.to_string()),
                 ..NoteAttributes::default()
             }),
             tag_names: Some(self.tag_names.clone()),
-            resources: audio.map(|audio| vec![audio_resource(audio)]),
+            resources: note_resources(cover, audio),
             ..types::Note::default()
         };
 
@@ -253,6 +256,42 @@ where
         notebook
             .guid
             .with_context(|| format!("Evernote notebook named '{name}' did not include a GUID"))
+    }
+}
+
+fn note_resources(
+    cover: Option<&CoverAttachment>,
+    audio: Option<&AudioAttachment>,
+) -> Option<Vec<Resource>> {
+    let mut resources = Vec::new();
+    if let Some(cover) = cover {
+        resources.push(cover_resource(cover));
+    }
+    if let Some(audio) = audio {
+        resources.push(audio_resource(audio));
+    }
+
+    if resources.is_empty() {
+        None
+    } else {
+        Some(resources)
+    }
+}
+
+fn cover_resource(cover: &CoverAttachment) -> Resource {
+    Resource {
+        data: Some(Data {
+            body_hash: Some(cover.md5_raw()),
+            size: Some(i32::try_from(cover.size()).unwrap_or(i32::MAX)),
+            body: Some(cover.body.clone()),
+        }),
+        mime: Some(cover.mime.clone()),
+        attributes: Some(ResourceAttributes {
+            file_name: Some(cover.file_name.clone()),
+            attachment: Some(false),
+            ..ResourceAttributes::default()
+        }),
+        ..Resource::default()
     }
 }
 
@@ -399,11 +438,12 @@ mod tests {
     };
 
     use super::*;
-    use crate::audio::TrackAudio;
+    use crate::audio::{CoverAttachment, CoverImage, TrackAudio};
 
     const NOTE_STORE_URL: &str = "https://www.evernote.com/shard/s1/notestore";
     const USER_STORE_URL: &str = "https://www.evernote.com/edam/user";
     const NOTEBOOK_GUID: &str = "00000000-0000-0000-0000-000000000001";
+    const SOURCE_URL: &str = "https://music.yandex.com/track/123";
 
     fn tag_names() -> Vec<String> {
         vec!["music".to_string(), "liked tracks".to_string()]
@@ -596,6 +636,8 @@ mod tests {
             .create_track_note(
                 "Title".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect("create note");
@@ -619,6 +661,14 @@ mod tests {
         assert_eq!(
             requests[0].note.tag_names.as_ref().unwrap(),
             &vec!["music".to_string(), "liked tracks".to_string()]
+        );
+        assert_eq!(
+            requests[0]
+                .note
+                .attributes
+                .as_ref()
+                .and_then(|attributes| attributes.source_u_r_l.as_deref()),
+            Some(SOURCE_URL)
         );
     }
 
@@ -648,6 +698,8 @@ mod tests {
             .create_track_note(
                 "Title".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 Some(&audio),
             )
             .expect("create note");
@@ -680,6 +732,55 @@ mod tests {
     }
 
     #[test]
+    fn create_track_note_attaches_cover_resource() {
+        let http = MockHttpClient::default();
+        http.push_response(create_note_response("note-guid"));
+        let client = EvernoteClient::with_http_client(
+            "token",
+            Some(NOTE_STORE_URL.to_string()),
+            USER_STORE_URL,
+            Some(NOTEBOOK_GUID.to_string()),
+            tag_names(),
+            http.clone(),
+        );
+        let cover = CoverAttachment::new(
+            CoverImage::new(b"cover".to_vec(), Some("image/png")).expect("cover image"),
+        );
+
+        client
+            .create_track_note(
+                "Title".to_string(),
+                "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                Some(&cover),
+                None,
+            )
+            .expect("create note");
+
+        let requests = http.create_requests();
+        assert_eq!(requests.len(), 1);
+        let resources = requests[0]
+            .note
+            .resources
+            .as_ref()
+            .expect("note should carry resources");
+        assert_eq!(resources.len(), 1);
+        let resource = &resources[0];
+        assert_eq!(resource.mime.as_deref(), Some("image/png"));
+        let attributes = resource.attributes.as_ref().expect("resource attributes");
+        assert_eq!(attributes.file_name.as_deref(), Some("cover.png"));
+        assert_eq!(attributes.attachment, Some(false));
+        let data = resource.data.as_ref().expect("resource data");
+        assert_eq!(data.body.as_deref(), Some(b"cover".as_slice()));
+        assert_eq!(data.size, Some(5));
+        assert_eq!(
+            data.body_hash.as_ref().map(|hash| hash.len()),
+            Some(16),
+            "body hash should be a raw MD5 digest"
+        );
+    }
+
+    #[test]
     fn create_track_note_discovers_note_store_url_when_missing() {
         let http = MockHttpClient::default();
         http.push_response(user_urls_response(NOTE_STORE_URL));
@@ -698,6 +799,8 @@ mod tests {
             .create_track_note(
                 "First".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect("create first note");
@@ -705,6 +808,8 @@ mod tests {
             .create_track_note(
                 "Second".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect("create second note");
@@ -760,6 +865,8 @@ mod tests {
             .create_track_note(
                 "First".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect("create first note");
@@ -767,6 +874,8 @@ mod tests {
             .create_track_note(
                 "Second".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect("create second note");
@@ -819,6 +928,8 @@ mod tests {
             .create_track_note(
                 "Title".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect_err("missing note GUID should fail");
@@ -850,6 +961,8 @@ mod tests {
             .create_track_note(
                 "Title".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect_err("missing notebook should fail");
@@ -888,6 +1001,8 @@ mod tests {
             .create_track_note(
                 "Title".to_string(),
                 "<en-note>Body</en-note>".to_string(),
+                SOURCE_URL.to_string(),
+                None,
                 None,
             )
             .expect_err("duplicate notebook should fail");

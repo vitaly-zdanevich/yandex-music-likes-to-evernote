@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use chrono::Utc;
 use tracing::{info, warn};
 
-use crate::audio::AudioAttachment;
+use crate::audio::{AudioAttachment, CoverAttachment};
 use crate::config::Settings;
 use crate::enrichment::EnrichmentClient;
 use crate::evernote_client::EvernoteClient;
@@ -90,12 +90,36 @@ pub fn run(settings: Settings) -> Result<()> {
         }
 
         let audio = downloaded_audio.map(|audio| AudioAttachment::new(audio, &title));
-        let content = note::enml(&track, &external_links, audio.as_ref());
-        let guid = evernote.create_track_note(title.clone(), content, audio.as_ref())?;
+        let cover = if let Some(cover_url) = track.cover_url.as_deref() {
+            match runtime.block_on(yandex.download_cover(cover_url)) {
+                Ok(Some(cover)) => Some(CoverAttachment::new(cover)),
+                Ok(None) => None,
+                Err(error) => {
+                    warn!(
+                        track_id = track.id,
+                        error = format!("{error:#}"),
+                        "cover download failed; creating note without embedded cover"
+                    );
+                    None
+                }
+            }
+        } else {
+            None
+        };
+
+        let content = note::enml(&track, &external_links, cover.as_ref(), audio.as_ref());
+        let guid = evernote.create_track_note(
+            title.clone(),
+            content,
+            track.yandex_url.clone(),
+            cover.as_ref(),
+            audio.as_ref(),
+        )?;
         info!(
             track_id = track.id,
             evernote_guid = guid,
             title = title,
+            cover_attached = cover.is_some(),
             audio_attached = audio.is_some(),
             "created Evernote note"
         );
