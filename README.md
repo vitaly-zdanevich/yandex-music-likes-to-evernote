@@ -22,7 +22,7 @@ Set these GitHub Actions repository secrets:
 
 - `YANDEX_MUSIC_TOKEN`: Yandex Music OAuth token.
 - `EVERNOTE_AUTH_TOKEN`: Evernote OAuth/developer auth token with note write access.
-- `GENIUS_ACCESS_TOKEN`: optional Genius API token. Without it, the tool adds a Genius search link instead of resolving a matched song URL.
+- `GENIUS_ACCESS_TOKEN`: optional Genius API token from [Genius API Clients](https://genius.com/api-clients). Without it, the tool adds a Genius search link instead of resolving a matched song URL.
 
 Optional GitHub Actions repository secrets or variables:
 
