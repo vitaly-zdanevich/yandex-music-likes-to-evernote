@@ -57,7 +57,7 @@ fn render_audio(audio: &AudioAttachment, duration_ms: Option<u128>) -> String {
 
     // Yandex reports no bitrate for lossless flac-mp4, so fall back to the average
     // bitrate derived from size and duration (marked with `~`) instead of "0 kbps".
-    let mut details = vec![encode_safe(&audio.quality).into_owned()];
+    let mut details = vec![display_audio_quality(&audio.quality).to_string()];
     if let Some((kbps, estimated)) = audio.display_bitrate_kbps(duration_ms) {
         let prefix = if estimated { "~" } else { "" };
         details.push(format!("{prefix}{kbps} kbps"));
@@ -65,6 +65,16 @@ fn render_audio(audio: &AudioAttachment, duration_ms: Option<u128>) -> String {
     let details = details.join(", ");
 
     format!("<div><b>Audio:</b> {details}</div>\n<en-media type=\"{mime}\" hash=\"{hash}\"/>")
+}
+
+/// Convert Yandex's internal quality codes into the lossless-or-lossy label we
+/// show in Evernote notes.
+fn display_audio_quality(quality: &str) -> &'static str {
+    if quality.eq_ignore_ascii_case("lossless") {
+        "lossless"
+    } else {
+        "lossy"
+    }
 }
 
 fn render_cover(cover: &CoverAttachment) -> String {
@@ -331,5 +341,40 @@ mod tests {
             enml.contains("<b>Audio:</b> lossless, ~800 kbps</div>"),
             "got: {enml}"
         );
+    }
+
+    #[test]
+    fn renders_yandex_lossy_quality_codes_as_lossy() {
+        for quality in ["nq", "lq"] {
+            let track = LikedTrack {
+                id: format!("lossy-{quality}"),
+                liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+                title: "Song".to_string(),
+                artists: vec!["Artist".to_string()],
+                artist_links: Vec::new(),
+                albums: Vec::new(),
+                album_links: Vec::new(),
+                duration_ms: None,
+                cover_url: None,
+                yandex_url: "https://music.yandex.com/track/lossy".to_string(),
+            };
+            let audio = AudioAttachment::new(
+                TrackAudio {
+                    bytes: b"hello".to_vec(),
+                    codec: "mp3".to_string(),
+                    bitrate_kbps: 192,
+                    quality: quality.to_string(),
+                },
+                &title(&track),
+            );
+
+            let enml = enml(&track, &[], None, Some(&audio));
+
+            assert!(
+                enml.contains("<b>Audio:</b> lossy, 192 kbps</div>"),
+                "got: {enml}"
+            );
+            assert!(!enml.contains(quality), "got: {enml}");
+        }
     }
 }
