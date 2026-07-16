@@ -92,3 +92,7 @@ To check the audio download path against the live API without creating any Evern
 ```bash
 cargo test live_audio_smoke -- --ignored --nocapture
 ```
+
+## See also
+
+- [evernote-pwa](https://github.com/vitaly-zdanevich/evernote-pwa) - installable web app to view and edit the latest Evernote notes, offline-capable.
