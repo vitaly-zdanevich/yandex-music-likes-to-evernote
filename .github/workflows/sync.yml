@@ -46,16 +46,33 @@ jobs:
           restore-keys: |
             yandex-music-state-
 
-      - name: Cache Rust build
+      - name: Restore Cargo registry cache
         uses: actions/cache@v5
         with:
           path: |
             ~/.cargo/git
             ~/.cargo/registry
-            target
-          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          key: rust-registry-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            rust-${{ runner.os }}-
+            rust-registry-${{ runner.os }}-
+
+      - name: Restore sync binary cache
+        id: sync-binary-cache
+        uses: actions/cache/restore@v5
+        with:
+          path: target/release/yandex-music-likes-to-evernote
+          key: sync-binary-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**/*.rs', 'build.rs', '.cargo/config.toml') }}
+
+      - name: Build sync binary
+        if: steps.sync-binary-cache.outputs.cache-hit != 'true'
+        run: cargo build --locked --release --bin yandex-music-likes-to-evernote
+
+      - name: Save sync binary cache
+        if: steps.sync-binary-cache.outputs.cache-hit != 'true'
+        uses: actions/cache/save@v5
+        with:
+          path: target/release/yandex-music-likes-to-evernote
+          key: sync-binary-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('Cargo.lock', 'Cargo.toml', 'src/**/*.rs', 'build.rs', '.cargo/config.toml') }}
 
       - name: Install AcoustID fingerprint tool
         if: ${{ env.ACOUSTID_API_KEY != '' }}
@@ -71,7 +88,7 @@ jobs:
           export ENABLED_EXTERNAL_LINK_SERVICES="${ENABLED_EXTERNAL_LINK_SERVICES:-}"
           export DISABLED_EXTERNAL_LINK_SERVICES="${DISABLED_EXTERNAL_LINK_SERVICES:-}"
           export SONGLINK_USER_COUNTRY="${SONGLINK_USER_COUNTRY:-US}"
-          cargo run --locked -- sync
+          target/release/yandex-music-likes-to-evernote sync
 
       - name: Ensure state file exists
         if: always()
