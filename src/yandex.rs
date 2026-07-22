@@ -9,7 +9,10 @@ use serde_json::Value;
 use tracing::warn;
 use yandex_music::{
     API_PATH, YandexMusicClient,
-    api::track::{get_file_info::GetFileInfoOptions, get_liked_tracks::GetLikedTracksOptions},
+    api::{
+        Endpoint,
+        track::{get_file_info::GetFileInfoOptions, get_liked_tracks::GetLikedTracksOptions},
+    },
     model::info::file_info::Quality,
 };
 
@@ -174,8 +177,7 @@ impl YandexClient {
         let mut last_error: Option<String> = None;
 
         for quality in AUDIO_QUALITIES {
-            let options = GetFileInfoOptions::new(track_id).quality(quality);
-            let file_info = match self.inner.get_file_info(&options).await {
+            let file_info = match self.fetch_file_info(track_id, quality).await {
                 Ok(file_info) => file_info,
                 Err(error) => {
                     last_error = Some(format!("{quality} quality unavailable: {error}"));
@@ -188,10 +190,13 @@ impl YandexClient {
                 .await
                 .with_context(|| format!("failed to download audio for track {track_id}"))?;
 
-            if file_info.size != 0 && bytes.len() as u64 != file_info.size {
+            if let Some(size) = file_info.size
+                && size != 0
+                && bytes.len() as u64 != size
+            {
                 warn!(
                     track_id,
-                    expected = file_info.size,
+                    expected = size,
                     downloaded = bytes.len(),
                     "downloaded audio size does not match the size reported by Yandex Music"
                 );
@@ -209,6 +214,47 @@ impl YandexClient {
             warn!(track_id, error, "no downloadable audio for track");
         }
         Ok(None)
+    }
+
+    /// Fetches tolerant audio file metadata from the Yandex Music API.
+    ///
+    /// The upstream crate requires `downloadInfo.size`, but the live API can omit
+    /// that field while still returning a valid signed download URL. For backups,
+    /// the URL is the required part; a missing size only means we skip byte-count
+    /// verification after download.
+    async fn fetch_file_info(&self, track_id: &str, quality: Quality) -> Result<RawTrackFileInfo> {
+        let options = GetFileInfoOptions::new(track_id).quality(quality);
+        let response = self
+            .inner
+            .inner
+            .get(format!("{API_PATH}{}", options.path()))
+            .send()
+            .await
+            .context("failed to request Yandex Music audio file info")?
+            .error_for_status()
+            .context("Yandex Music returned an HTTP error for audio file info")?;
+        let response = response
+            .json::<YandexApiResponse>()
+            .await
+            .context("failed to parse Yandex Music audio file info response")?;
+
+        if let Some(error) = response.error {
+            return Err(anyhow!(
+                "Yandex Music API error while fetching audio file info: {}{}",
+                error.name,
+                error
+                    .message
+                    .map(|message| format!(": {message}"))
+                    .unwrap_or_default()
+            ));
+        }
+
+        let result = response
+            .result
+            .context("Yandex Music audio file info response did not include result")?;
+        let result = serde_json::from_value::<RawGetFileInfoResult>(result)
+            .context("failed to decode Yandex Music audio file info")?;
+        Ok(result.download_info)
     }
 
     /// Download a cover image so Evernote can embed it as an inline resource
@@ -270,6 +316,23 @@ struct YandexApiResponse {
 struct YandexApiError {
     name: String,
     message: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawGetFileInfoResult {
+    download_info: RawTrackFileInfo,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct RawTrackFileInfo {
+    bitrate: u32,
+    codec: String,
+    quality: String,
+    #[serde(default)]
+    size: Option<u64>,
+    url: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -547,6 +610,30 @@ mod tests {
         assert!(error.to_string().contains("expected string or number"));
     }
 
+    #[test]
+    fn decodes_audio_file_info_without_reported_size() {
+        let result = serde_json::from_str::<RawGetFileInfoResult>(
+            r#"{
+                "downloadInfo": {
+                    "bitrate": 192,
+                    "codec": "mp3",
+                    "quality": "lq",
+                    "url": "https://storage.example.test/audio.mp3"
+                }
+            }"#,
+        )
+        .expect("file info should decode without size");
+
+        assert_eq!(result.download_info.bitrate, 192);
+        assert_eq!(result.download_info.codec, "mp3");
+        assert_eq!(result.download_info.quality, "lq");
+        assert_eq!(result.download_info.size, None);
+        assert_eq!(
+            result.download_info.url,
+            "https://storage.example.test/audio.mp3"
+        );
+    }
+
     /// Manual end-to-end smoke test against the live Yandex Music API. Excluded
     /// from normal/CI runs (`#[ignore]`); needs `YANDEX_MUSIC_TOKEN` in the
     /// environment or a local `.env`. Downloads one liked track to verify the
@@ -606,8 +693,7 @@ mod tests {
         let mut counts: std::collections::BTreeMap<String, usize> =
             std::collections::BTreeMap::new();
         for track in tracks.iter().rev().take(sample) {
-            let options = GetFileInfoOptions::new(&track.id).quality(Quality::Lossless);
-            match client.inner.get_file_info(&options).await {
+            match client.fetch_file_info(&track.id, Quality::Lossless).await {
                 Ok(info) => {
                     *counts
                         .entry(format!("{} {}", info.quality, info.codec))
