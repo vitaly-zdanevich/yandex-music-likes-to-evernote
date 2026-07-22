@@ -1,5 +1,5 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     io::{self, Write as _},
     process::Command,
     sync::{
@@ -33,11 +33,36 @@ const ACOUSTID_MIN_SCORE: f64 = 0.80;
 const SONGLINK_MAX_ATTEMPTS: usize = 3;
 const SONGLINK_BACKOFFS: [Duration; 2] = [Duration::from_secs(10), Duration::from_secs(30)];
 const SONGLINK_MAX_RETRY_AFTER: Duration = Duration::from_secs(60);
+const WIKIDATA_API_URL: &str = "https://www.wikidata.org/w/api.php";
 
+/// A note row pointing to an external music or metadata service.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ExternalLink {
+    /// Human-readable link text shown in Evernote when the row is clickable.
     pub label: String,
+    /// Absolute URL or preview URL rendered into the Evernote note.
     pub url: String,
+    /// Rendering behavior for this row.
+    pub kind: ExternalLinkKind,
+}
+
+/// Controls how an [`ExternalLink`] is serialized into Evernote ENML.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalLinkKind {
+    /// Render as a normal clickable anchor.
+    Link,
+    /// Render as a blank row between exact IDs and generic searches.
+    Separator,
+    /// Render as a bare YouTube URL so Evernote clients can create a preview.
+    YouTubeEmbed,
+}
+
+/// Maps a Wikidata external-id property to the service link it can produce.
+struct WikidataExternalIdLink {
+    property: &'static str,
+    service: ExternalLinkService,
+    label: &'static str,
+    url_builder: fn(&str) -> Option<String>,
 }
 
 impl ExternalLink {
@@ -45,6 +70,23 @@ impl ExternalLink {
         Self {
             label: label.into(),
             url: url.into(),
+            kind: ExternalLinkKind::Link,
+        }
+    }
+
+    fn separator() -> Self {
+        Self {
+            label: String::new(),
+            url: String::new(),
+            kind: ExternalLinkKind::Separator,
+        }
+    }
+
+    fn youtube_embed(url: impl Into<String>) -> Self {
+        Self {
+            label: "YouTube video".to_string(),
+            url: url.into(),
+            kind: ExternalLinkKind::YouTubeEmbed,
         }
     }
 }
@@ -86,6 +128,57 @@ enum ExternalLinkService {
     YouTube,
     YouTubeMusic,
 }
+
+const WIKIDATA_EXTERNAL_ID_LINKS: &[WikidataExternalIdLink] = &[
+    WikidataExternalIdLink {
+        property: "P2207",
+        service: ExternalLinkService::Spotify,
+        label: "Spotify track",
+        url_builder: spotify_track_url,
+    },
+    WikidataExternalIdLink {
+        property: "P10110",
+        service: ExternalLinkService::AppleMusic,
+        label: "Apple Music track",
+        url_builder: apple_music_track_url,
+    },
+    WikidataExternalIdLink {
+        property: "P2724",
+        service: ExternalLinkService::Deezer,
+        label: "Deezer track",
+        url_builder: deezer_track_url,
+    },
+    WikidataExternalIdLink {
+        property: "P3040",
+        service: ExternalLinkService::SoundCloud,
+        label: "SoundCloud",
+        url_builder: soundcloud_id_url,
+    },
+    WikidataExternalIdLink {
+        property: "P4578",
+        service: ExternalLinkService::Tidal,
+        label: "TIDAL track",
+        url_builder: tidal_track_url,
+    },
+    WikidataExternalIdLink {
+        property: "P1730",
+        service: ExternalLinkService::AllMusic,
+        label: "AllMusic song",
+        url_builder: allmusic_song_url,
+    },
+    WikidataExternalIdLink {
+        property: "P6079",
+        service: ExternalLinkService::Discogs,
+        label: "Discogs track",
+        url_builder: discogs_track_url,
+    },
+    WikidataExternalIdLink {
+        property: "P6218",
+        service: ExternalLinkService::Genius,
+        label: "Genius",
+        url_builder: genius_page_url,
+    },
+];
 
 impl ExternalLinkService {
     fn parse(name: &str) -> Option<Self> {
@@ -217,6 +310,8 @@ impl EnrichmentClient {
         track: &LikedTrack,
         audio: Option<&TrackAudio>,
     ) -> Vec<ExternalLink> {
+        let mut exact_links = self.wikidata_exact_links(track).await.unwrap_or_default();
+        let has_wikidata_item = !exact_links.is_empty();
         let mut links = Vec::new();
 
         links.extend(youtube_links(
@@ -253,6 +348,7 @@ impl EnrichmentClient {
             track,
             &self.enabled_services,
             &self.disabled_services,
+            !has_wikidata_item,
         ));
 
         if self.service_enabled(ExternalLinkService::Genius) {
@@ -263,7 +359,15 @@ impl EnrichmentClient {
             );
         }
 
-        links
+        if exact_links.is_empty() {
+            links
+        } else {
+            if !links.is_empty() {
+                exact_links.push(ExternalLink::separator());
+            }
+            exact_links.extend(links);
+            exact_links
+        }
     }
 
     fn service_enabled(&self, service: ExternalLinkService) -> bool {
@@ -305,6 +409,139 @@ impl EnrichmentClient {
         })];
         links.extend(musicbrainz_entity_search_links(track));
         links
+    }
+
+    /// Looks up a Wikidata item by exact Yandex Music track ID (P13289), then
+    /// converts supported claims on that item into direct service links.
+    async fn wikidata_exact_links(&self, track: &LikedTrack) -> Option<Vec<ExternalLink>> {
+        if !self.service_enabled(ExternalLinkService::Wikidata) {
+            return None;
+        }
+
+        let item_id = self.wikidata_item_id_for_yandex_track(&track.id).await?;
+        let mut links = vec![ExternalLink::new(
+            "Wikidata item",
+            wikidata_item_url(&item_id),
+        )];
+
+        let claims = match self.wikidata_claims_for_item(&item_id).await {
+            Some(claims) => claims,
+            None => return Some(links),
+        };
+
+        let item_labels = self
+            .wikidata_item_labels(wikidata_related_item_ids(&claims))
+            .await;
+        links.extend(wikidata_links_from_claims(
+            &claims,
+            &item_labels,
+            &self.enabled_services,
+            &self.disabled_services,
+        ));
+        Some(links)
+    }
+
+    /// Searches Wikidata for an item with Yandex Music track ID (P13289).
+    async fn wikidata_item_id_for_yandex_track(&self, track_id: &str) -> Option<String> {
+        if !valid_yandex_track_id(track_id) {
+            return None;
+        }
+
+        let url = wikidata_track_item_lookup_url(track_id)?;
+        let response = match self.http.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "Wikidata track lookup failed");
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            warn!(status = %response.status(), "Wikidata track lookup returned non-success status");
+            return None;
+        }
+
+        let response = match response.json::<WikidataSearchResponse>().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "Wikidata track lookup returned invalid JSON");
+                return None;
+            }
+        };
+
+        wikidata_track_item_id(&response)
+    }
+
+    /// Loads the claims for one Wikidata item so exact external IDs can be used.
+    async fn wikidata_claims_for_item(
+        &self,
+        item_id: &str,
+    ) -> Option<HashMap<String, Vec<WikidataStatement>>> {
+        let url = wikidata_track_claims_lookup_url(item_id)?;
+        let response = match self.http.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, item_id, "Wikidata item claims lookup failed");
+                return None;
+            }
+        };
+        if !response.status().is_success() {
+            warn!(
+                status = %response.status(),
+                item_id,
+                "Wikidata item claims lookup returned non-success status"
+            );
+            return None;
+        }
+
+        let response = match response.json::<WikidataEntitiesResponse>().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, item_id, "Wikidata item claims lookup returned invalid JSON");
+                return None;
+            }
+        };
+
+        response
+            .entities
+            .get(item_id)
+            .map(|entity| entity.claims.clone())
+    }
+
+    /// Loads English labels for linked Wikidata items used in claim-derived rows.
+    async fn wikidata_item_labels(&self, item_ids: Vec<String>) -> HashMap<String, String> {
+        if item_ids.is_empty() {
+            return HashMap::new();
+        }
+
+        let url = wikidata_item_labels_lookup_url(&item_ids);
+        let response = match self.http.get(&url).send().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "Wikidata item label lookup failed");
+                return HashMap::new();
+            }
+        };
+        if !response.status().is_success() {
+            warn!(status = %response.status(), "Wikidata item label lookup returned non-success status");
+            return HashMap::new();
+        }
+
+        let response = match response.json::<WikidataEntitiesResponse>().await {
+            Ok(response) => response,
+            Err(error) => {
+                warn!(error = %error, "Wikidata item label lookup returned invalid JSON");
+                return HashMap::new();
+            }
+        };
+
+        response
+            .entities
+            .into_iter()
+            .filter_map(|(item_id, entity)| {
+                let label = wikidata_entity_label(&entity)?;
+                Some((item_id, label))
+            })
+            .collect()
     }
 
     /// Uses AcoustID to resolve downloaded audio to exact MusicBrainz entities.
@@ -820,10 +1057,137 @@ fn musicbrainz_entity_search_links(track: &LikedTrack) -> Vec<ExternalLink> {
     links
 }
 
+/// Converts validated Wikidata claims into exact links for services the sync
+/// already exposes as external-link services.
+fn wikidata_links_from_claims(
+    claims: &HashMap<String, Vec<WikidataStatement>>,
+    item_labels: &HashMap<String, String>,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Vec<ExternalLink> {
+    let mut links = Vec::new();
+
+    push_wikidata_item_claim_links(
+        &mut links,
+        claims,
+        item_labels,
+        "P921",
+        "Wikidata main subject",
+    );
+    push_wikidata_item_claim_links(
+        &mut links,
+        claims,
+        item_labels,
+        "P737",
+        "Wikidata influenced by",
+    );
+    push_wikidata_item_claim_links(&mut links, claims, item_labels, "P407", "Wikidata language");
+
+    if let Some(recording_id) = wikidata_claim_string(claims, "P4404").filter(|id| valid_uuid(id)) {
+        if external_link_service_enabled(
+            ExternalLinkService::MusicBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "MusicBrainz recording",
+                musicbrainz_recording_url(&recording_id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::ListenBrainz,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "ListenBrainz recording metadata",
+                listenbrainz_recording_metadata_url(&recording_id),
+            ));
+        }
+        if external_link_service_enabled(
+            ExternalLinkService::TheAudioDb,
+            enabled_services,
+            disabled_services,
+        ) {
+            links.push(ExternalLink::new(
+                "TheAudioDB track MBID lookup",
+                theaudiodb_track_mbid_url(&recording_id),
+            ));
+        }
+    }
+
+    if let Some(video_id) = wikidata_claim_string(claims, "P1651").filter(|id| valid_youtube_id(id))
+        && external_link_service_enabled(
+            ExternalLinkService::YouTube,
+            enabled_services,
+            disabled_services,
+        )
+    {
+        links.push(ExternalLink::youtube_embed(youtube_video_url(&video_id)));
+    }
+
+    for spec in WIKIDATA_EXTERNAL_ID_LINKS {
+        if let Some(link) =
+            wikidata_external_id_link(claims, spec, enabled_services, disabled_services)
+        {
+            links.push(link);
+        }
+    }
+
+    links
+}
+
+/// Adds Wikidata item-valued claim links such as main subject and language.
+fn push_wikidata_item_claim_links(
+    links: &mut Vec<ExternalLink>,
+    claims: &HashMap<String, Vec<WikidataStatement>>,
+    item_labels: &HashMap<String, String>,
+    property: &str,
+    label_prefix: &str,
+) {
+    for item_id in wikidata_claim_item_ids(claims, property) {
+        let label = item_labels
+            .get(&item_id)
+            .map(|label| format!("{label_prefix}: {label}"))
+            .unwrap_or_else(|| format!("{label_prefix}: {item_id}"));
+        links.push(ExternalLink::new(label, wikidata_item_url(&item_id)));
+    }
+}
+
+/// Builds one exact external-ID link if the Wikidata claim and service are enabled.
+fn wikidata_external_id_link(
+    claims: &HashMap<String, Vec<WikidataStatement>>,
+    spec: &WikidataExternalIdLink,
+    enabled_services: &HashSet<ExternalLinkService>,
+    disabled_services: &HashSet<ExternalLinkService>,
+) -> Option<ExternalLink> {
+    if !external_link_service_enabled(spec.service, enabled_services, disabled_services) {
+        return None;
+    }
+
+    let value = wikidata_claim_string(claims, spec.property)?;
+    let url = (spec.url_builder)(&value)?;
+    Some(ExternalLink::new(spec.label, url))
+}
+
+/// Returns the related Wikidata item IDs whose labels should be loaded.
+fn wikidata_related_item_ids(claims: &HashMap<String, Vec<WikidataStatement>>) -> Vec<String> {
+    let mut item_ids = Vec::new();
+    for property in ["P921", "P737", "P407"] {
+        for item_id in wikidata_claim_item_ids(claims, property) {
+            if !item_ids.contains(&item_id) {
+                item_ids.push(item_id);
+            }
+        }
+    }
+    item_ids
+}
+
 fn wikimedia_links(
     track: &LikedTrack,
     enabled_services: &HashSet<ExternalLinkService>,
     disabled_services: &HashSet<ExternalLinkService>,
+    include_wikidata_track_search: bool,
 ) -> Vec<ExternalLink> {
     let mut links = Vec::new();
     let wikidata_enabled = external_link_service_enabled(
@@ -846,7 +1210,7 @@ fn wikimedia_links(
     } else {
         track.title.clone()
     };
-    if wikidata_enabled && !track_query.trim().is_empty() {
+    if wikidata_enabled && include_wikidata_track_search && !track_query.trim().is_empty() {
         links.push(ExternalLink::new(
             "Wikidata track search",
             wikidata_search_url(&track_query),
@@ -1308,8 +1672,60 @@ fn songlink_lookup_url(track: &LikedTrack) -> String {
     )
 }
 
+fn wikidata_track_item_lookup_url(track_id: &str) -> Option<String> {
+    valid_yandex_track_id(track_id).then(|| {
+        query_url(
+            WIKIDATA_API_URL,
+            &[
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("action", "query"),
+                ("list", "search"),
+                ("srsearch", &format!("haswbstatement:P13289={track_id}")),
+                ("srnamespace", "0"),
+                ("srlimit", "1"),
+                ("srprop", ""),
+            ],
+        )
+    })
+}
+
+fn wikidata_track_claims_lookup_url(item_id: &str) -> Option<String> {
+    valid_wikidata_item_id(item_id).then(|| {
+        query_url(
+            WIKIDATA_API_URL,
+            &[
+                ("format", "json"),
+                ("formatversion", "2"),
+                ("action", "wbgetentities"),
+                ("ids", item_id),
+                ("props", "claims"),
+            ],
+        )
+    })
+}
+
+fn wikidata_item_labels_lookup_url(item_ids: &[String]) -> String {
+    query_url(
+        WIKIDATA_API_URL,
+        &[
+            ("format", "json"),
+            ("formatversion", "2"),
+            ("action", "wbgetentities"),
+            ("ids", &item_ids.join("|")),
+            ("props", "labels"),
+            ("languages", "en|ru|uk"),
+            ("languagefallback", "1"),
+        ],
+    )
+}
+
 fn wikidata_search_url(query: &str) -> String {
     query_url("https://www.wikidata.org/w/index.php", &[("search", query)])
+}
+
+fn wikidata_item_url(item_id: &str) -> String {
+    format!("https://www.wikidata.org/wiki/{item_id}")
 }
 
 fn wikipedia_search_url(query: &str) -> String {
@@ -1331,12 +1747,40 @@ fn spotify_search_url(query: &str) -> String {
     query_url("https://open.spotify.com/search", &[("q", query)])
 }
 
+fn spotify_track_url(track_id: &str) -> Option<String> {
+    valid_spotify_track_id(track_id).then(|| format!("https://open.spotify.com/track/{track_id}"))
+}
+
 fn apple_music_search_url(query: &str) -> String {
     query_url("https://music.apple.com/search", &[("term", query)])
 }
 
+fn apple_music_track_url(track_id: &str) -> Option<String> {
+    if !valid_apple_music_track_id(track_id) {
+        return None;
+    }
+
+    if let Some((album_id, item_id)) = track_id.split_once("?i=") {
+        return Some(format!(
+            "https://geo.music.apple.com/album/id{album_id}?i={item_id}"
+        ));
+    }
+
+    Some(query_url(
+        "https://wikidata-externalid-url.toolforge.org/",
+        &[
+            ("url_prefix", "https://geo.music.apple.com/album/id"),
+            ("id", track_id),
+        ],
+    ))
+}
+
 fn deezer_search_url(query: &str) -> String {
     query_url("https://www.deezer.com/search", &[("q", query)])
+}
+
+fn deezer_track_url(track_id: &str) -> Option<String> {
+    valid_nonzero_numeric_id(track_id).then(|| format!("https://www.deezer.com/track/{track_id}"))
 }
 
 fn bandcamp_search_url(query: &str) -> String {
@@ -1347,12 +1791,25 @@ fn soundcloud_search_url(query: &str) -> String {
     query_url("https://soundcloud.com/search", &[("q", query)])
 }
 
+fn soundcloud_id_url(id: &str) -> Option<String> {
+    valid_soundcloud_id(id).then(|| format!("https://soundcloud.com/{id}"))
+}
+
 fn discogs_search_url(query: &str) -> String {
     query_url("https://www.discogs.com/search/", &[("q", query)])
 }
 
+fn discogs_track_url(track_id: &str) -> Option<String> {
+    valid_uuid(track_id)
+        .then(|| format!("https://www.discogs.com/track/{}", track_id.to_lowercase()))
+}
+
 fn tidal_search_url(query: &str) -> String {
     path_search_url("https://tidal.com/search", query)
+}
+
+fn tidal_track_url(track_id: &str) -> Option<String> {
+    valid_nonzero_numeric_id(track_id).then(|| format!("https://tidal.com/browse/track/{track_id}"))
 }
 
 fn qobuz_search_url(query: &str) -> String {
@@ -1384,6 +1841,10 @@ fn secondhandsongs_search_url(query: &str) -> String {
 
 fn allmusic_search_url(query: &str) -> String {
     path_search_url("https://www.allmusic.com/search/all", query)
+}
+
+fn allmusic_song_url(song_id: &str) -> Option<String> {
+    valid_allmusic_song_id(song_id).then(|| format!("https://www.allmusic.com/song/{song_id}"))
 }
 
 fn listenbrainz_search_url(query: &str) -> String {
@@ -1498,6 +1959,21 @@ fn youtube_search_url(track: &LikedTrack) -> String {
         "https://www.youtube.com/results",
         &[("search_query", &human_query(track))],
     )
+}
+
+fn youtube_video_url(video_id: &str) -> String {
+    query_url("https://www.youtube.com/watch", &[("v", video_id)])
+}
+
+fn musicbrainz_recording_url(recording_id: &str) -> String {
+    format!(
+        "https://musicbrainz.org/recording/{}",
+        recording_id.to_lowercase()
+    )
+}
+
+fn genius_page_url(genius_id: &str) -> Option<String> {
+    valid_genius_id(genius_id).then(|| format!("https://genius.com/{genius_id}"))
 }
 
 fn musicbrainz_query(track: &LikedTrack) -> String {
@@ -1650,6 +2126,219 @@ struct GeniusHit {
 #[derive(Debug, Deserialize)]
 struct GeniusHitResult {
     url: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikidataSearchResponse {
+    query: Option<WikidataSearchQuery>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikidataSearchQuery {
+    #[serde(default)]
+    search: Vec<WikidataSearchResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikidataSearchResult {
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct WikidataEntitiesResponse {
+    #[serde(default)]
+    entities: HashMap<String, WikidataEntity>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataEntity {
+    #[serde(default)]
+    claims: HashMap<String, Vec<WikidataStatement>>,
+    #[serde(default)]
+    labels: HashMap<String, WikidataLabel>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataLabel {
+    value: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataStatement {
+    mainsnak: WikidataSnak,
+    rank: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataSnak {
+    snaktype: String,
+    datavalue: Option<WikidataDataValue>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct WikidataDataValue {
+    value: serde_json::Value,
+}
+
+/// Returns the first valid Q-id from a Wikidata search response.
+fn wikidata_track_item_id(response: &WikidataSearchResponse) -> Option<String> {
+    response
+        .query
+        .as_ref()?
+        .search
+        .iter()
+        .map(|result| result.title.trim())
+        .find(|title| valid_wikidata_item_id(title))
+        .map(ToOwned::to_owned)
+}
+
+/// Extracts the first active string-valued claim for a Wikidata property.
+fn wikidata_claim_string(
+    claims: &HashMap<String, Vec<WikidataStatement>>,
+    property: &str,
+) -> Option<String> {
+    claims.get(property)?.iter().find_map(|statement| {
+        let value = active_wikidata_datavalue(statement)?;
+        let value = match value {
+            serde_json::Value::String(value) => value.trim().to_string(),
+            serde_json::Value::Number(value) => value.to_string(),
+            _ => return None,
+        };
+        (!value.is_empty()).then_some(value)
+    })
+}
+
+/// Extracts unique active item-valued Q-ids for a Wikidata property.
+fn wikidata_claim_item_ids(
+    claims: &HashMap<String, Vec<WikidataStatement>>,
+    property: &str,
+) -> Vec<String> {
+    let mut item_ids = Vec::new();
+    let Some(statements) = claims.get(property) else {
+        return item_ids;
+    };
+
+    for statement in statements {
+        let Some(value) = active_wikidata_datavalue(statement) else {
+            continue;
+        };
+        let Some(item_id) = wikidata_datavalue_item_id(value) else {
+            continue;
+        };
+        if !item_ids.contains(&item_id) {
+            item_ids.push(item_id);
+        }
+    }
+
+    item_ids
+}
+
+/// Picks a readable label from Wikidata's language-fallback response.
+fn wikidata_entity_label(entity: &WikidataEntity) -> Option<String> {
+    ["en", "ru", "uk"]
+        .into_iter()
+        .filter_map(|language| entity.labels.get(language))
+        .chain(entity.labels.values())
+        .map(|label| label.value.trim())
+        .find(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn active_wikidata_datavalue(statement: &WikidataStatement) -> Option<&serde_json::Value> {
+    if statement.rank.as_deref() == Some("deprecated") || statement.mainsnak.snaktype != "value" {
+        return None;
+    }
+
+    Some(&statement.mainsnak.datavalue.as_ref()?.value)
+}
+
+fn wikidata_datavalue_item_id(value: &serde_json::Value) -> Option<String> {
+    let object = value.as_object()?;
+    if let Some(item_id) = object.get("id").and_then(|id| id.as_str())
+        && valid_wikidata_item_id(item_id)
+    {
+        return Some(item_id.to_string());
+    }
+
+    let numeric_id = object.get("numeric-id")?.as_u64()?;
+    let item_id = format!("Q{numeric_id}");
+    valid_wikidata_item_id(&item_id).then_some(item_id)
+}
+
+fn valid_yandex_track_id(track_id: &str) -> bool {
+    valid_nonzero_numeric_id(track_id.trim())
+}
+
+fn valid_wikidata_item_id(item_id: &str) -> bool {
+    item_id
+        .strip_prefix('Q')
+        .is_some_and(valid_nonzero_numeric_id)
+}
+
+fn valid_uuid(value: &str) -> bool {
+    let parts = value.split('-').collect::<Vec<_>>();
+    let expected_lengths = [8, 4, 4, 4, 12];
+    parts.len() == expected_lengths.len()
+        && parts
+            .iter()
+            .zip(expected_lengths)
+            .all(|(part, expected_len)| {
+                part.len() == expected_len && part.chars().all(|ch| ch.is_ascii_hexdigit())
+            })
+}
+
+fn valid_youtube_id(value: &str) -> bool {
+    value.len() == 11
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn valid_spotify_track_id(value: &str) -> bool {
+    value.len() == 22 && value.chars().all(|ch| ch.is_ascii_alphanumeric())
+}
+
+fn valid_apple_music_track_id(value: &str) -> bool {
+    if let Some((album_id, track_id)) = value.split_once("?i=") {
+        return valid_nonzero_numeric_id(album_id) && valid_nonzero_numeric_id(track_id);
+    }
+
+    valid_nonzero_numeric_id(value)
+}
+
+fn valid_nonzero_numeric_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.bytes().all(|byte| byte.is_ascii_digit())
+        && value.bytes().any(|byte| byte != b'0')
+}
+
+fn valid_soundcloud_id(value: &str) -> bool {
+    !value.is_empty()
+        && !value.starts_with('/')
+        && !value.contains("//")
+        && !value.contains("..")
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '/'))
+}
+
+fn valid_allmusic_song_id(value: &str) -> bool {
+    !value.is_empty()
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_'))
+}
+
+fn valid_genius_id(value: &str) -> bool {
+    let starts_correctly = value
+        .chars()
+        .next()
+        .is_some_and(|ch| ch.is_ascii_uppercase() || ch.is_ascii_digit());
+    starts_correctly
+        && (value.ends_with("-lyrics") || value.ends_with("-annotated"))
+        && value
+            .chars()
+            .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
 }
 
 #[cfg(test)]
@@ -2191,7 +2880,7 @@ mod tests {
             "https://lrclib.net/api/get?track_name=Song+%26+Name&artist_name=&album_name="
         );
         assert_eq!(
-            wikimedia_links(&track, &enabled_services, &disabled_services),
+            wikimedia_links(&track, &enabled_services, &disabled_services, true),
             vec![
                 ExternalLink::new(
                     "Wikidata track search",
@@ -2234,7 +2923,7 @@ mod tests {
         let disabled_services = no_disabled_services();
 
         assert_eq!(
-            wikimedia_links(&track, &enabled_services, &disabled_services),
+            wikimedia_links(&track, &enabled_services, &disabled_services, true),
             vec![
                 ExternalLink::new(
                     "Wikidata track search",
@@ -2260,6 +2949,187 @@ mod tests {
                     "Wikipedia album search",
                     "https://en.wikipedia.org/w/index.php?search=Artist+Name+Album+Name"
                 ),
+            ]
+        );
+    }
+
+    #[test]
+    fn can_skip_wikidata_track_search_after_exact_item_match() {
+        let track = sample_track();
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
+
+        let links = wikimedia_links(&track, &enabled_services, &disabled_services, false);
+
+        assert!(
+            !links
+                .iter()
+                .any(|link| link.label == "Wikidata track search")
+        );
+        assert!(links.contains(&ExternalLink::new(
+            "Wikidata artist search",
+            "https://www.wikidata.org/w/index.php?search=Artist+Name"
+        )));
+        assert!(links.contains(&ExternalLink::new(
+            "Wikipedia track search",
+            "https://en.wikipedia.org/w/index.php?search=Artist+Name+Song+%26+Name"
+        )));
+    }
+
+    #[test]
+    fn builds_exact_wikidata_lookup_urls() {
+        let lookup_url = wikidata_track_item_lookup_url("105978624").expect("valid lookup URL");
+        assert_eq!(
+            lookup_url,
+            "https://www.wikidata.org/w/api.php?format=json&formatversion=2&action=query&list=search&srsearch=haswbstatement%3AP13289%3D105978624&srnamespace=0&srlimit=1&srprop="
+        );
+        assert!(wikidata_track_item_lookup_url("not-a-number").is_none());
+
+        let claims_url = wikidata_track_claims_lookup_url("Q105978624").expect("valid claims URL");
+        assert_eq!(
+            claims_url,
+            "https://www.wikidata.org/w/api.php?format=json&formatversion=2&action=wbgetentities&ids=Q105978624&props=claims"
+        );
+        assert!(wikidata_track_claims_lookup_url("P13289").is_none());
+    }
+
+    #[test]
+    fn extracts_wikidata_item_id_from_search_response() {
+        let response = serde_json::from_str::<WikidataSearchResponse>(
+            r#"{
+                "query": {
+                    "search": [
+                        {"title": "Project:Ignore"},
+                        {"title": "Q105978624"}
+                    ]
+                }
+            }"#,
+        )
+        .expect("search response");
+
+        assert_eq!(
+            wikidata_track_item_id(&response),
+            Some("Q105978624".to_string())
+        );
+    }
+
+    #[test]
+    fn converts_wikidata_claims_into_exact_external_links() {
+        let response = serde_json::from_str::<WikidataEntitiesResponse>(
+            r#"{
+                "entities": {
+                    "Q105978624": {
+                        "claims": {
+                            "P921": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": {"entity-type": "item", "numeric-id": 2, "id": "Q2"}}},
+                                "rank": "normal"
+                            }],
+                            "P737": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": {"entity-type": "item", "numeric-id": 3, "id": "Q3"}}},
+                                "rank": "normal"
+                            }],
+                            "P407": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": {"entity-type": "item", "numeric-id": 4, "id": "Q4"}}},
+                                "rank": "normal"
+                            }],
+                            "P4404": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"}},
+                                "rank": "normal"
+                            }],
+                            "P1651": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "dQw4w9WgXcQ"}},
+                                "rank": "normal"
+                            }],
+                            "P2207": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "4uLU6hMCjMI75M1A2tKUQC"}},
+                                "rank": "normal"
+                            }],
+                            "P10110": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "1440833098?i=1440833918"}},
+                                "rank": "normal"
+                            }],
+                            "P2724": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "3135556"}},
+                                "rank": "normal"
+                            }],
+                            "P3040": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "artist/song"}},
+                                "rank": "normal"
+                            }],
+                            "P4578": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "12345"}},
+                                "rank": "normal"
+                            }],
+                            "P1730": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "mt0000000000"}},
+                                "rank": "normal"
+                            }],
+                            "P6079": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"}},
+                                "rank": "normal"
+                            }],
+                            "P6218": [{
+                                "mainsnak": {"snaktype": "value", "datavalue": {"value": "Artist-song-lyrics"}},
+                                "rank": "normal"
+                            }]
+                        }
+                    }
+                }
+            }"#,
+        )
+        .expect("entities response");
+        let claims = &response.entities["Q105978624"].claims;
+        let labels = HashMap::from([
+            ("Q2".to_string(), "Main topic".to_string()),
+            ("Q3".to_string(), "Influence".to_string()),
+            ("Q4".to_string(), "English".to_string()),
+        ]);
+        let enabled_services = no_enabled_services();
+        let disabled_services = no_disabled_services();
+
+        assert_eq!(
+            wikidata_related_item_ids(claims),
+            vec!["Q2".to_string(), "Q3".to_string(), "Q4".to_string()]
+        );
+        assert_eq!(
+            wikidata_links_from_claims(claims, &labels, &enabled_services, &disabled_services),
+            vec![
+                ExternalLink::new("Wikidata main subject: Main topic", wikidata_item_url("Q2")),
+                ExternalLink::new("Wikidata influenced by: Influence", wikidata_item_url("Q3")),
+                ExternalLink::new("Wikidata language: English", wikidata_item_url("Q4")),
+                ExternalLink::new(
+                    "MusicBrainz recording",
+                    "https://musicbrainz.org/recording/aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                ),
+                ExternalLink::new(
+                    "ListenBrainz recording metadata",
+                    "https://api.listenbrainz.org/1/metadata/recording/?recording_mbids=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa&inc=artist+release"
+                ),
+                ExternalLink::new(
+                    "TheAudioDB track MBID lookup",
+                    "https://www.theaudiodb.com/api/v1/json/2/track-mb.php?i=aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+                ),
+                ExternalLink::youtube_embed("https://www.youtube.com/watch?v=dQw4w9WgXcQ"),
+                ExternalLink::new(
+                    "Spotify track",
+                    "https://open.spotify.com/track/4uLU6hMCjMI75M1A2tKUQC"
+                ),
+                ExternalLink::new(
+                    "Apple Music track",
+                    "https://geo.music.apple.com/album/id1440833098?i=1440833918"
+                ),
+                ExternalLink::new("Deezer track", "https://www.deezer.com/track/3135556"),
+                ExternalLink::new("SoundCloud", "https://soundcloud.com/artist/song"),
+                ExternalLink::new("TIDAL track", "https://tidal.com/browse/track/12345"),
+                ExternalLink::new(
+                    "AllMusic song",
+                    "https://www.allmusic.com/song/mt0000000000"
+                ),
+                ExternalLink::new(
+                    "Discogs track",
+                    "https://www.discogs.com/track/bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+                ),
+                ExternalLink::new("Genius", "https://genius.com/Artist-song-lyrics"),
             ]
         );
     }

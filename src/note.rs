@@ -1,7 +1,7 @@
 use html_escape::encode_safe;
 
 use crate::audio::{AudioAttachment, CoverAttachment};
-use crate::enrichment::ExternalLink;
+use crate::enrichment::{ExternalLink, ExternalLinkKind};
 use crate::yandex::LikedTrack;
 
 pub fn title(track: &LikedTrack) -> String {
@@ -145,9 +145,17 @@ fn render_external_links(links: &[ExternalLink]) -> String {
     let rows = links
         .iter()
         .map(|link| {
-            let label = encode_safe(&link.label);
             let url = encode_safe(&link.url);
-            format!("<div><a href=\"{url}\">{label}</a></div>")
+            match link.kind {
+                ExternalLinkKind::Link => {
+                    let label = encode_safe(&link.label);
+                    format!("<div><a href=\"{url}\">{label}</a></div>")
+                }
+                ExternalLinkKind::Separator => "<div><br/></div>".to_string(),
+                // Evernote ENML rejects iframe/embed tags, so a plain YouTube URL
+                // gives Evernote clients the best chance to render a native preview.
+                ExternalLinkKind::YouTubeEmbed => format!("<div>{url}</div>"),
+            }
         })
         .collect::<Vec<_>>()
         .join("\n");
@@ -187,6 +195,7 @@ mod tests {
         let links = vec![ExternalLink {
             label: "MusicBrainz recording search".to_string(),
             url: "https://musicbrainz.org/search?query=a&b=c".to_string(),
+            kind: ExternalLinkKind::Link,
         }];
         let cover = CoverAttachment::new(
             CoverImage::new(b"cover".to_vec(), Some("image/jpeg")).expect("cover image"),
@@ -341,6 +350,47 @@ mod tests {
             enml.contains("<b>Audio:</b> lossless, ~800 kbps</div>"),
             "got: {enml}"
         );
+    }
+
+    #[test]
+    fn renders_external_link_separator_and_youtube_preview_url() {
+        let track = LikedTrack {
+            id: "6".to_string(),
+            liked_at: chrono::Utc.with_ymd_and_hms(2024, 1, 2, 3, 4, 5).unwrap(),
+            title: "Song".to_string(),
+            artists: vec!["Artist".to_string()],
+            artist_links: Vec::new(),
+            albums: Vec::new(),
+            album_links: Vec::new(),
+            duration_ms: None,
+            cover_url: None,
+            yandex_url: "https://music.yandex.com/track/6".to_string(),
+        };
+        let links = vec![
+            ExternalLink {
+                label: "Wikidata item".to_string(),
+                url: "https://www.wikidata.org/wiki/Q105978624".to_string(),
+                kind: ExternalLinkKind::Link,
+            },
+            ExternalLink {
+                label: String::new(),
+                url: String::new(),
+                kind: ExternalLinkKind::Separator,
+            },
+            ExternalLink {
+                label: "YouTube video".to_string(),
+                url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ".to_string(),
+                kind: ExternalLinkKind::YouTubeEmbed,
+            },
+        ];
+
+        let enml = enml(&track, &links, None, None);
+
+        assert!(enml.contains("<div><br/></div>\n<div><a href="));
+        assert!(enml.contains("<div><br/></div>\n<div>https:&#x2F;&#x2F;www.youtube.com&#x2F;watch?v=dQw4w9WgXcQ</div>"));
+        assert!(!enml.contains("<iframe"));
+        assert!(!enml.contains("<embed"));
+        assert!(!enml.contains(">YouTube video</a>"));
     }
 
     #[test]
