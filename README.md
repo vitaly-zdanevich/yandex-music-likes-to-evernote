@@ -16,6 +16,8 @@ Rust CLI for a scheduled GitHub Actions job that backs up newly liked Yandex Mus
 
 Each note contains the track metadata and links back to Yandex Music. By default it **also attaches the track's audio file** to the note for personal backup: downloaded in the highest quality the account is entitled to and stored **without re-encoding** (lossless FLAC when your Yandex Plus tier allows it, otherwise the best available lossy stream). Set `BACKUP_AUDIO=false` for metadata-only notes.
 
+Cover artwork is embedded at Yandex's original resolution: size placeholders in cover URLs use `orig` instead of a fixed thumbnail size, following the [original-cover download convention](https://github.com/llistochek/yandex-music-downloader/blob/main/ymd/core.py). Image bytes are attached without resizing or re-encoding; dimensions depend on the source artwork. URLs without a size placeholder are used as supplied. This applies to newly created notes; previously saved notes are not upgraded automatically.
+
 ## Configuration
 
 Set these GitHub Actions repository secrets:

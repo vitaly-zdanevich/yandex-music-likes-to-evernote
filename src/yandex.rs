@@ -442,8 +442,10 @@ fn album_link(album: &RawAlbum) -> Option<AlbumLink> {
     })
 }
 
+/// Request Yandex's original artwork dimensions instead of a resized thumbnail.
+/// URLs without a size placeholder retain the image supplied by the API.
 fn normalize_cover_url(uri: String) -> String {
-    let uri = uri.replace("%%", "400x400");
+    let uri = uri.replace("%%", "orig");
     if uri.starts_with("http://") || uri.starts_with("https://") {
         uri
     } else {
@@ -504,10 +506,33 @@ mod tests {
     use super::*;
 
     #[test]
-    fn normalizes_cover_uri() {
+    fn requests_original_cover_resolution() {
+        for prefix in ["", "https://", "http://"] {
+            let uri = format!("{prefix}avatars.yandex.net/get-music-content/1/abc/%%");
+            let expected_prefix = if prefix.is_empty() {
+                "https://"
+            } else {
+                prefix
+            };
+            assert_eq!(
+                normalize_cover_url(uri),
+                format!("{expected_prefix}avatars.yandex.net/get-music-content/1/abc/orig")
+            );
+        }
+    }
+
+    #[test]
+    fn preserves_cover_urls_without_size_placeholders() {
+        for uri in [
+            "https://avatars.yandex.net/get-music-content/1/abc/orig",
+            "https://example.test/cover.jpg?size=400x400",
+            "http://example.test/cover.png",
+        ] {
+            assert_eq!(normalize_cover_url(uri.to_string()), uri);
+        }
         assert_eq!(
-            normalize_cover_url("avatars.yandex.net/get-music-content/1/abc%%".to_string()),
-            "https://avatars.yandex.net/get-music-content/1/abc400x400"
+            normalize_cover_url("example.test/cover.jpg".to_string()),
+            "https://example.test/cover.jpg"
         );
     }
 
@@ -519,7 +544,7 @@ mod tests {
                 "title": "Track Title",
                 "artists": [{"id": 456, "name": "Artist"}],
                 "albums": [{"id": 789, "title": "Album"}],
-                "coverUri": "avatars.yandex.net/get-music-content/1/abc%%",
+                "coverUri": "avatars.yandex.net/get-music-content/1/abc/%%",
                 "durationMs": 123000,
                 "metaData": {
                     "volume": 2019
@@ -552,6 +577,10 @@ mod tests {
             }]
         );
         assert_eq!(track.duration_ms, Some(123000));
+        assert_eq!(
+            track.cover_url.as_deref(),
+            Some("https://avatars.yandex.net/get-music-content/1/abc/orig")
+        );
     }
 
     #[test]
